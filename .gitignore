@@ -1,0 +1,5 @@
+.env
+business.db
+__pycache__/
+*.pyc
+.venv/
