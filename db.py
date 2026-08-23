@@ -494,6 +494,64 @@ def top_products(limit=5):
         ).fetchall()
 
 
+def abc_analysis():
+    """
+    Classic ABC analysis of every product/item by profit contribution:
+      Tier A = items whose cumulative profit share reaches up to 80%
+      Tier B = the next slice up to 95%
+      Tier C = the remaining long tail
+    Returns a list sorted by profit descending, each entry a dict with
+    item, profit, revenue, times_sold, profit_pct, cumulative_pct, tier.
+    Returns [] if there's no profit data yet, or if total profit isn't positive
+    (e.g. everything logged so far is a net loss -- tiering isn't meaningful then).
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT MIN(item) as item, SUM(profit) as total_profit, SUM(sold_price) as total_revenue,
+                   COUNT(*) as times_sold
+            FROM (
+                SELECT item, profit, sold_price FROM sales
+                UNION ALL
+                SELECT item, profit, sold_price FROM subscriptions
+            ) t
+            GROUP BY LOWER(item)
+            ORDER BY total_profit DESC
+            """
+        ).fetchall()
+
+    total_profit = sum(r["total_profit"] for r in rows)
+    if total_profit <= 0:
+        return []
+
+    result = []
+    cumulative_pct = 0.0
+    for r in rows:
+        profit = r["total_profit"]
+        profit_pct = max(profit, 0) / total_profit * 100
+        # Classify using the cumulative % *before* this item, so the item that pushes
+        # the running total past a threshold is still counted in the tier it started in
+        # -- otherwise a single dominant product (e.g. 85% of all profit alone) would
+        # incorrectly land in Tier B instead of A.
+        if cumulative_pct < 80:
+            tier = "A"
+        elif cumulative_pct < 95:
+            tier = "B"
+        else:
+            tier = "C"
+        cumulative_pct += profit_pct
+        result.append({
+            "item": r["item"],
+            "profit": profit,
+            "revenue": r["total_revenue"],
+            "times_sold": r["times_sold"],
+            "profit_pct": round(profit_pct, 1),
+            "cumulative_pct": round(min(cumulative_pct, 100.0), 1),
+            "tier": tier,
+        })
+    return result
+
+
 # ---------- staff management ----------
 
 def add_staff(user_id: int, name: str):
