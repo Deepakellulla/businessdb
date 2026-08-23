@@ -37,6 +37,16 @@ SALE_ITEM, SALE_CUSTOMER, SALE_DATE, SALE_GROSS, SALE_DISCOUNT, SALE_COST, SALE_
 EDIT_SALE_PRICE, EDIT_SALE_COST = range(17, 19)
 EDIT_SUB_PRICE, EDIT_SUB_COST = range(19, 21)
 
+# Lifetime subscriptions are stored as a very-far-future end date rather than NULL,
+# so all existing date comparisons/sorting/reminders work unchanged -- a subscription
+# with this many days left will never realistically trigger a reminder.
+LIFETIME_DAYS = 36500  # 100 years
+LIFETIME_THRESHOLD_DAYS = 3650  # 10+ years left is treated as "lifetime" for display
+
+
+def _is_lifetime_duration(days: int) -> bool:
+    return days >= LIFETIME_THRESHOLD_DAYS
+
 
 # ================= small helpers =================
 
@@ -538,14 +548,18 @@ async def newsub_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _sub_ask_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("30 days", callback_data="dur:30"),
-        InlineKeyboardButton("90 days", callback_data="dur:90"),
-        InlineKeyboardButton("365 days", callback_data="dur:365"),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("30 days", callback_data="dur:30"),
+            InlineKeyboardButton("90 days", callback_data="dur:90"),
+            InlineKeyboardButton("365 days", callback_data="dur:365"),
+        ],
+        [InlineKeyboardButton("🔓 Lifetime (no expiry)", callback_data="dur:lifetime")],
+    ])
     await reply_to(
         update,
-        "📋 <b>New Subscription</b> — Step 8/8\n\n📅 Duration? Tap a preset, or type the number of days.",
+        "📋 <b>New Subscription</b> — Step 8/8\n\n📅 Duration? Tap a preset, or type the number of days "
+        "(or type \"lifetime\" for one with no expiry).",
         reply_markup=keyboard,
     )
     return SUB_DURATION
@@ -581,7 +595,10 @@ def _sub_summary_text(d: dict) -> str:
     lines.append(price_line)
     lines.append(f"💵 Cost: {d['cost_price']:.2f}")
     lines.append(f"💳 Payment: {esc(d['payment_method'])}")
-    lines.append(f"📅 Duration: {d['duration']} days (ends {end_date.isoformat()})")
+    if _is_lifetime_duration(d["duration"]):
+        lines.append("📅 Duration: <b>Lifetime</b> (no expiry, no renewal reminders)")
+    else:
+        lines.append(f"📅 Duration: {d['duration']} days (ends {end_date.isoformat()})")
     lines.append("")
     lines.append(f"➡️ Net: <b>{sold:.2f}</b>")
     lines.append(f"➡️ Profit: <b>{profit:.2f}</b>")
@@ -595,16 +612,21 @@ async def _sub_show_confirmation(update: Update, context: ContextTypes.DEFAULT_T
 
 async def newsub_duration_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ack(update)
-    days = int(update.callback_query.data.split(":", 1)[1])
+    raw = update.callback_query.data.split(":", 1)[1]
+    days = LIFETIME_DAYS if raw == "lifetime" else int(raw)
     context.user_data["duration"] = days
     return await _sub_show_confirmation(update, context)
 
 
 async def newsub_duration_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    if text in ("lifetime", "forever", "never", "no expiry", "no expiration", "unlimited"):
+        context.user_data["duration"] = LIFETIME_DAYS
+        return await _sub_show_confirmation(update, context)
     try:
-        days = int(update.message.text.strip())
+        days = int(text)
     except ValueError:
-        await reply_to(update, "Please send a whole number of days, or tap a preset above.")
+        await reply_to(update, "Please send a whole number of days, tap a preset above, or type \"lifetime\".")
         return SUB_DURATION
     context.user_data["duration"] = days
     return await _sub_show_confirmation(update, context)
@@ -627,15 +649,20 @@ async def sub_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             all_subs = [dict(r) for r in db.all_subscriptions()]
             asyncio.create_task(asyncio.to_thread(sheets.push_subscription, sub_row, all_sales, all_subs))
 
-        msg = f"✅ <b>Subscription #{sub_id} saved!</b>\nEnds {end_date.isoformat()} · Profit: <b>{profit:.2f}</b>\n\n"
-        if end_date <= date.today():
-            msg += (
-                "📌 This subscription's term already ended based on the date you entered — "
-                "it'll show as inactive after today's reminder check runs, and you may get "
-                "an \"ended\" notification for it. That's expected for backfilled data."
-            )
+        is_lifetime = _is_lifetime_duration(d["duration"])
+        if is_lifetime:
+            msg = f"✅ <b>Subscription #{sub_id} saved!</b>\nDuration: <b>Lifetime</b> · Profit: <b>{profit:.2f}</b>\n\n"
+            msg += "🔓 No expiry — this subscription won't trigger any renewal reminders."
         else:
-            msg += f"I'll remind you {REMINDER_DAYS_BEFORE} days before it ends, and on the day."
+            msg = f"✅ <b>Subscription #{sub_id} saved!</b>\nEnds {end_date.isoformat()} · Profit: <b>{profit:.2f}</b>\n\n"
+            if end_date <= date.today():
+                msg += (
+                    "📌 This subscription's term already ended based on the date you entered — "
+                    "it'll show as inactive after today's reminder check runs, and you may get "
+                    "an \"ended\" notification for it. That's expected for backfilled data."
+                )
+            else:
+                msg += f"I'll remind you {REMINDER_DAYS_BEFORE} days before it ends, and on the day."
         await reply_to(update, msg)
         context.user_data.clear()
         return ConversationHandler.END
@@ -789,9 +816,11 @@ async def subs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         end = date.fromisoformat(r["end_date"])
         days_left = (end - today).days
+        when = "🔓 Lifetime" if _is_lifetime_duration(days_left) else (
+            f"ends {r['end_date']} ({days_left} day{'s' if days_left != 1 else ''} left)"
+        )
         lines.append(
-            f"• #{r['id']} <b>{esc(r['customer'])}</b> — {esc(r['item'])} — ends {r['end_date']} "
-            f"({days_left} day{'s' if days_left != 1 else ''} left) — profit {r['profit']:.2f}"
+            f"• #{r['id']} <b>{esc(r['customer'])}</b> — {esc(r['item'])} — {when} — profit {r['profit']:.2f}"
         )
     await reply_to(update, "\n".join(lines))
 
@@ -913,7 +942,8 @@ async def customer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today = date.today()
         for s in profile["active_subscriptions"]:
             days_left = (date.fromisoformat(s["end_date"]) - today).days
-            lines.append(f"• #{s['id']} {esc(s['item'])} — ends {s['end_date']} ({days_left}d left)")
+            when = "🔓 Lifetime" if _is_lifetime_duration(days_left) else f"ends {s['end_date']} ({days_left}d left)"
+            lines.append(f"• #{s['id']} {esc(s['item'])} — {when}")
 
     if profile["sales"]:
         lines.append(f"\n<b>Sales history</b> ({len(profile['sales'])})")
