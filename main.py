@@ -110,7 +110,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Quick reference</b>\n"
         "🧾 /newsale — log a sale\n"
         "📋 /newsub — log a subscription\n"
-        "📊 /stats · 📅 /monthly · 🏆 /top · ♻️ /renewal\n"
+        "📊 /stats · 📅 /monthly · 🏆 /top · 📈 /abc · ♻️ /renewal\n"
         "👤 /customer &lt;name&gt; · 🔍 /search &lt;keyword&gt;\n"
         "📤 /export · 💾 /backup · 📊 /syncsheets\n"
         "🛠 /editsale, /deletesale, /editsub, /deletesub\n"
@@ -135,10 +135,13 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🏆 Top", callback_data="menu:top"),
-            InlineKeyboardButton("♻️ Renewal Rate", callback_data="menu:renewal"),
+            InlineKeyboardButton("📈 ABC Analysis", callback_data="menu:abc"),
         ],
         [
+            InlineKeyboardButton("♻️ Renewal Rate", callback_data="menu:renewal"),
             InlineKeyboardButton("📤 Export CSV", callback_data="menu:export"),
+        ],
+        [
             InlineKeyboardButton("💾 Backup", callback_data="menu:backup"),
         ],
     ]
@@ -150,7 +153,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = update.callback_query.data.split(":", 1)[1]
     dispatch = {
         "stats": stats_cmd, "monthly": monthly_cmd, "subs": subs_cmd, "sales": sales_cmd,
-        "top": top_cmd, "renewal": renewal_cmd, "export": export_cmd, "backup": backup_cmd,
+        "top": top_cmd, "abc": abc_cmd, "renewal": renewal_cmd, "export": export_cmd, "backup": backup_cmd,
     }
     fn = dispatch.get(action)
     if fn:
@@ -968,6 +971,40 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_to(update, "\n".join(lines))
 
 
+async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = db.abc_analysis()
+    if not result:
+        await reply_to(update, "Not enough profit data yet for an ABC analysis — log a few sales first.")
+        return
+
+    tiers = {"A": [], "B": [], "C": []}
+    for r in result:
+        tiers[r["tier"]].append(r)
+
+    tier_labels = {
+        "A": ("🅰️", "Top performers", "focus here — these drive most of your profit"),
+        "B": ("🅱️", "Steady contributors", "solid, worth keeping an eye on"),
+        "C": ("🆑", "Long tail", "small individually — consider trimming or bundling"),
+    }
+
+    lines = ["📈 <b>ABC Analysis</b> — products ranked by profit contribution"]
+    for tier in ("A", "B", "C"):
+        items = tiers[tier]
+        if not items:
+            continue
+        icon, label, note = tier_labels[tier]
+        tier_profit_pct = sum(i["profit_pct"] for i in items)
+        lines.append(f"\n{icon} <b>Tier {tier} — {label}</b> ({len(items)} item{'s' if len(items) != 1 else ''}, {tier_profit_pct:.1f}% of profit)")
+        lines.append(f"<i>{note}</i>")
+        shown = items if tier != "C" else items[:15]
+        for i in shown:
+            lines.append(f"• {esc(i['item'])} — profit {i['profit']:.2f} ({i['profit_pct']:.1f}%), sold {i['times_sold']}x")
+        if tier == "C" and len(items) > 15:
+            lines.append(f"…and {len(items) - 15} more")
+
+    await reply_to(update, "\n".join(lines))
+
+
 async def renewal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = db.renewal_churn_stats(grace_days=30)
     if stats["total_ended"] == 0:
@@ -1123,6 +1160,7 @@ async def post_init(app: Application):
         BotCommand("customer", "A customer's history"),
         BotCommand("search", "Search sales & subscriptions"),
         BotCommand("top", "Top customers & products"),
+        BotCommand("abc", "ABC analysis of products by profit"),
         BotCommand("renewal", "Renewal & churn rate"),
         BotCommand("export", "Download CSV export"),
         BotCommand("backup", "Download database backup"),
@@ -1157,6 +1195,7 @@ def main():
     app.add_handler(CommandHandler("customer", customer_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
+    app.add_handler(CommandHandler("abc", abc_cmd))
     app.add_handler(CommandHandler("renewal", renewal_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
@@ -1166,7 +1205,7 @@ def main():
 
     # menu button dispatch (read-only actions only; newsale/newsub are conversation entry points below)
     app.add_handler(CallbackQueryHandler(
-        menu_callback, pattern="^menu:(stats|monthly|subs|sales|top|renewal|export|backup)$"
+        menu_callback, pattern="^menu:(stats|monthly|subs|sales|top|abc|renewal|export|backup)$"
     ))
 
     sale_conv = ConversationHandler(
