@@ -31,11 +31,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- conversation states ----------
-SALE_ITEM, SALE_CUSTOMER, SALE_GROSS, SALE_DISCOUNT, SALE_COST, SALE_PAYMENT, SALE_CONFIRM = range(7)
+SALE_ITEM, SALE_CUSTOMER, SALE_DATE, SALE_GROSS, SALE_DISCOUNT, SALE_COST, SALE_PAYMENT, SALE_CONFIRM = range(8)
 (SUB_CUSTOMER, SUB_ITEM, SUB_DATE, SUB_GROSS, SUB_DISCOUNT, SUB_COST, SUB_PAYMENT,
- SUB_DURATION, SUB_CONFIRM) = range(7, 16)
-EDIT_SALE_PRICE, EDIT_SALE_COST = range(16, 18)
-EDIT_SUB_PRICE, EDIT_SUB_COST = range(18, 20)
+ SUB_DURATION, SUB_CONFIRM) = range(8, 17)
+EDIT_SALE_PRICE, EDIT_SALE_COST = range(17, 19)
+EDIT_SUB_PRICE, EDIT_SUB_COST = range(19, 21)
 
 
 # ================= small helpers =================
@@ -222,7 +222,7 @@ async def newsale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth(update):
         return ConversationHandler.END
     context.user_data.clear()
-    await reply_to(update, "🧾 <b>New Sale</b> — Step 1/6\n\n🏷 What item/product was sold?")
+    await reply_to(update, "🧾 <b>New Sale</b> — Step 1/7\n\n🏷 What item/product was sold?")
     return SALE_ITEM
 
 
@@ -231,26 +231,56 @@ async def newsale_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="cust_skip")]])
     await reply_to(
         update,
-        "🧾 <b>New Sale</b> — Step 2/6\n\n👤 Customer name? (or tap Skip)",
+        "🧾 <b>New Sale</b> — Step 2/7\n\n👤 Customer name? (or tap Skip)",
         reply_markup=keyboard,
     )
     return SALE_CUSTOMER
 
 
-async def _sale_ask_gross(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_to(update, "🧾 <b>New Sale</b> — Step 3/6\n\n💰 Price charged (before any discount)?")
-    return SALE_GROSS
+async def _sale_ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📅 Today", callback_data="saledate_today")]])
+    await reply_to(
+        update,
+        "🧾 <b>New Sale</b> — Step 3/7\n\n"
+        "📅 When was this sold? Tap Today, or type a date (e.g. 2026-06-15 or 15-06-2026) "
+        "to backfill a past sale — profit will count toward that month.",
+        reply_markup=keyboard,
+    )
+    return SALE_DATE
 
 
 async def newsale_customer_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ack(update)
     context.user_data["customer"] = None
-    return await _sale_ask_gross(update, context)
+    return await _sale_ask_date(update, context)
 
 
 async def newsale_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["customer"] = None if text == "-" else text
+    return await _sale_ask_date(update, context)
+
+
+async def _sale_ask_gross(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await reply_to(update, "🧾 <b>New Sale</b> — Step 4/7\n\n💰 Price charged (before any discount)?")
+    return SALE_GROSS
+
+
+async def newsale_date_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ack(update)
+    context.user_data["sale_date"] = date.today()
+    return await _sale_ask_gross(update, context)
+
+
+async def newsale_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = _parse_date_input(update.message.text)
+    if parsed is None:
+        await reply_to(update, "Couldn't read that date. Try YYYY-MM-DD (e.g. 2026-06-15) or tap Today above.")
+        return SALE_DATE
+    if parsed > date.today():
+        await reply_to(update, "That date is in the future — please send today's date or an earlier one.")
+        return SALE_DATE
+    context.user_data["sale_date"] = parsed
     return await _sale_ask_gross(update, context)
 
 
@@ -258,7 +288,7 @@ async def _sale_ask_discount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("0️⃣ No discount", callback_data="disc_zero")]])
     await reply_to(
         update,
-        "🧾 <b>New Sale</b> — Step 4/6\n\n🏷 Any discount given? Send the amount, or tap for none.",
+        "🧾 <b>New Sale</b> — Step 5/7\n\n🏷 Any discount given? Send the amount, or tap for none.",
         reply_markup=keyboard,
     )
     return SALE_DISCOUNT
@@ -274,7 +304,7 @@ async def newsale_gross(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _sale_ask_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_to(update, "🧾 <b>New Sale</b> — Step 5/6\n\n💵 Cost price? (number)")
+    await reply_to(update, "🧾 <b>New Sale</b> — Step 6/7\n\n💵 Cost price? (number)")
     return SALE_COST
 
 
@@ -303,7 +333,7 @@ async def newsale_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await reply_to(update, "Please send a valid number for cost price.")
         return SALE_COST
-    await reply_to(update, "🧾 <b>New Sale</b> — Step 6/6\n\n💳 Payment method?", reply_markup=payment_keyboard())
+    await reply_to(update, "🧾 <b>New Sale</b> — Step 7/7\n\n💳 Payment method?", reply_markup=payment_keyboard())
     return SALE_PAYMENT
 
 
@@ -313,6 +343,7 @@ def _sale_summary_text(d: dict) -> str:
     lines = ["🔎 <b>Review Sale</b>", ""]
     lines.append(f"🏷 Item: <b>{esc(d['item'])}</b>")
     lines.append(f"👤 Customer: {esc(d['customer']) if d['customer'] else '—'}")
+    lines.append(f"📅 Sold on: {d['sale_date'].isoformat()}")
     price_line = f"💰 Price: {d['gross_price']:.2f}"
     if d["discount"]:
         price_line += f" (−{d['discount']:.2f} discount)"
@@ -365,16 +396,19 @@ async def sale_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
             d["item"], d["customer"], sold_price, d["cost_price"],
             logged_by=display_name(update), discount=d["discount"],
             gross_price=d["gross_price"], payment_method=d["payment_method"],
+            sale_date=d["sale_date"],
         )
         if sheets.is_configured():
             sale_row = dict(db.get_sale(sale_id))
-            asyncio.create_task(asyncio.to_thread(sheets.push_sale, sale_row))
+            all_sales = [dict(r) for r in db.all_sales()]
+            all_subs = [dict(r) for r in db.all_subscriptions()]
+            asyncio.create_task(asyncio.to_thread(sheets.push_sale, sale_row, all_sales, all_subs))
         await reply_to(update, f"✅ <b>Sale #{sale_id} saved!</b>\nProfit: <b>{profit:.2f}</b>")
         context.user_data.clear()
         return ConversationHandler.END
     elif action == "restart":
         context.user_data.clear()
-        await reply_to(update, "🧾 <b>New Sale</b> — Step 1/6\n\n🏷 What item/product was sold?")
+        await reply_to(update, "🧾 <b>New Sale</b> — Step 1/7\n\n🏷 What item/product was sold?")
         return SALE_ITEM
     else:
         context.user_data.clear()
@@ -586,7 +620,9 @@ async def sub_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         if sheets.is_configured():
             sub_row = dict(db.get_subscription(sub_id))
-            asyncio.create_task(asyncio.to_thread(sheets.push_subscription, sub_row))
+            all_sales = [dict(r) for r in db.all_sales()]
+            all_subs = [dict(r) for r in db.all_subscriptions()]
+            asyncio.create_task(asyncio.to_thread(sheets.push_subscription, sub_row, all_sales, all_subs))
 
         msg = f"✅ <b>Subscription #{sub_id} saved!</b>\nEnds {end_date.isoformat()} · Profit: <b>{profit:.2f}</b>\n\n"
         if end_date <= date.today():
