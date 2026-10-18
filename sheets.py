@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import threading
 from collections import defaultdict
 
 import gspread
@@ -13,12 +14,14 @@ logger = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 SALES_HEADERS = [
-    "ID", "Date", "Item", "Customer", "Gross Price", "Discount", "Sold Price",
-    "Cost Price", "Profit", "Payment Method", "Logged By",
+    "ID", "Date", "Item", "Customer", "Seller", "Supplier", "Gross Price", "Discount",
+    "Sold Price", "Cost Price", "Profit", "Amount Paid", "Balance Due",
+    "Payment Method", "Logged By",
 ]
 SUBS_HEADERS = [
-    "ID", "Customer", "Item", "Gross Price", "Discount", "Sold Price", "Cost Price",
-    "Profit", "Start Date", "End Date", "Active", "Payment Method", "Logged By",
+    "ID", "Customer", "Phone", "Item", "Seller", "Supplier", "Gross Price", "Discount",
+    "Sold Price", "Cost Price", "Profit", "Amount Paid", "Balance Due",
+    "Start Date", "End Date", "Active", "Payment Method", "Logged By",
 ]
 MONTHLY_HEADERS = [
     "Month", "Sales Revenue", "Sales Profit", "Subscription Revenue",
@@ -27,6 +30,9 @@ MONTHLY_HEADERS = [
 
 _client = None
 _spreadsheet = None
+# Live pushes run in background threads; without a lock two quick entries (or an entry plus
+# /syncsheets) could interleave their writes and scramble a tab.
+_lock = threading.RLock()
 
 
 def is_configured() -> bool:
@@ -63,19 +69,30 @@ def _get_or_create_worksheet(title: str, headers: list):
     return ws
 
 
+def _paid(s: dict) -> float:
+    paid = s.get("amount_paid")
+    return s["sold_price"] if paid is None else paid
+
+
+def _balance(s: dict) -> float:
+    return round(max(s["sold_price"] - _paid(s), 0.0), 2)
+
+
 def _sale_row(s: dict) -> list:
     return [
-        s["id"], s["sale_date"], s["item"], s["customer"] or "",
-        s["gross_price"], s["discount"], s["sold_price"], s["cost_price"], s["profit"],
-        s["payment_method"] or "", s["logged_by"] or "",
+        s["id"], s["sale_date"], s["item"], s["customer"] or "", s.get("seller") or "",
+        s.get("supplier") or "", s["gross_price"], s["discount"], s["sold_price"], s["cost_price"],
+        s["profit"], _paid(s), _balance(s), s["payment_method"] or "", s["logged_by"] or "",
     ]
 
 
 def _sub_row(s: dict) -> list:
     return [
-        s["id"], s["customer"], s["item"], s["gross_price"], s["discount"],
-        s["sold_price"], s["cost_price"], s["profit"], s["start_date"], s["end_date"],
-        "Yes" if s["active"] else "No", s["payment_method"] or "", s["logged_by"] or "",
+        s["id"], s["customer"], (f"+{s['phone']}" if s.get("phone") else ""), s["item"],
+        s.get("seller") or "", s.get("supplier") or "", s["gross_price"], s["discount"],
+        s["sold_price"], s["cost_price"], s["profit"], _paid(s), _balance(s),
+        s["start_date"], s["end_date"], "Yes" if s["active"] else "No",
+        s["payment_method"] or "", s["logged_by"] or "",
     ]
 
 
@@ -122,16 +139,16 @@ def _refresh_monthly_summary(all_sales, all_subs):
 def push_sale(sale_row: dict, all_sales=None, all_subs=None):
     """
     Best-effort: logs and swallows errors so a Sheets outage never breaks saving data.
-    If all_sales/all_subs are provided, also refreshes the Monthly Summary tab so it
-    stays in sync with this new entry; pass None to skip that (e.g. for lighter callers).
+    If all_sales/all_subs are provided, also refreshes the Monthly Summary tab.
     """
     if not is_configured():
         return
     try:
-        ws = _get_or_create_worksheet("Sales", SALES_HEADERS)
-        ws.append_row(_sale_row(sale_row))
-        if all_sales is not None and all_subs is not None:
-            _refresh_monthly_summary(all_sales, all_subs)
+        with _lock:
+            ws = _get_or_create_worksheet("Sales", SALES_HEADERS)
+            ws.append_row(_sale_row(sale_row))
+            if all_sales is not None and all_subs is not None:
+                _refresh_monthly_summary(all_sales, all_subs)
     except Exception:
         logger.exception("Failed to push sale to Google Sheets")
 
@@ -140,10 +157,11 @@ def push_subscription(sub_row: dict, all_sales=None, all_subs=None):
     if not is_configured():
         return
     try:
-        ws = _get_or_create_worksheet("Subscriptions", SUBS_HEADERS)
-        ws.append_row(_sub_row(sub_row))
-        if all_sales is not None and all_subs is not None:
-            _refresh_monthly_summary(all_sales, all_subs)
+        with _lock:
+            ws = _get_or_create_worksheet("Subscriptions", SUBS_HEADERS)
+            ws.append_row(_sub_row(sub_row))
+            if all_sales is not None and all_subs is not None:
+                _refresh_monthly_summary(all_sales, all_subs)
     except Exception:
         logger.exception("Failed to push subscription to Google Sheets")
 
@@ -154,20 +172,29 @@ def full_resync(all_sales, all_subs) -> tuple:
     if not is_configured():
         raise RuntimeError("Google Sheets is not configured.")
 
-    ws_sales = _get_or_create_worksheet("Sales", SALES_HEADERS)
-    ws_sales.clear()
-    ws_sales.append_row(SALES_HEADERS)
-    rows = [_sale_row(s) for s in all_sales]
-    if rows:
-        ws_sales.append_rows(rows)
+    with _lock:
+        ws_sales = _get_or_create_worksheet("Sales", SALES_HEADERS)
+        ws_sales.clear()
+        ws_sales.append_row(SALES_HEADERS)
+        rows = [_sale_row(s) for s in all_sales]
+        if rows:
+            ws_sales.append_rows(rows)
 
-    ws_subs = _get_or_create_worksheet("Subscriptions", SUBS_HEADERS)
-    ws_subs.clear()
-    ws_subs.append_row(SUBS_HEADERS)
-    rows2 = [_sub_row(s) for s in all_subs]
-    if rows2:
-        ws_subs.append_rows(rows2)
+        ws_subs = _get_or_create_worksheet("Subscriptions", SUBS_HEADERS)
+        ws_subs.clear()
+        ws_subs.append_row(SUBS_HEADERS)
+        rows2 = [_sub_row(s) for s in all_subs]
+        if rows2:
+            ws_subs.append_rows(rows2)
 
-    _refresh_monthly_summary(all_sales, all_subs)
+        _refresh_monthly_summary(all_sales, all_subs)
 
     return len(all_sales), len(all_subs)
+
+
+def safe_full_resync(all_sales, all_subs):
+    """Same as full_resync but never raises -- for background use after edits/deletes/payments."""
+    try:
+        full_resync(all_sales, all_subs)
+    except Exception:
+        logger.exception("Background Google Sheets resync failed")
