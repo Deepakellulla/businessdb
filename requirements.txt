@@ -3,3 +3,4 @@ python-dotenv==1.0.1
 psycopg2-binary==2.9.10
 gspread==6.1.4
 google-auth==2.35.0
+tzdata==2025.2
