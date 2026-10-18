@@ -81,20 +81,45 @@ def init_db():
                 added_date TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id SERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                default_price DOUBLE PRECISION,
+                default_cost DOUBLE PRECISION,
+                default_duration INTEGER,
+                default_supplier TEXT
+            )
+        """)
         conn.commit()
 
         # migration: add columns for databases created before they existed
+        common_cols = [
+            ("logged_by", "TEXT"), ("discount", "DOUBLE PRECISION DEFAULT 0"),
+            ("gross_price", "DOUBLE PRECISION"), ("payment_method", "TEXT"),
+            ("seller", "TEXT"), ("supplier", "TEXT"),
+            ("amount_paid", "DOUBLE PRECISION"), ("created_at", "TIMESTAMPTZ"),
+        ]
+        sub_only_cols = [("phone", "TEXT"), ("renewed_to", "INTEGER")]
         for table, new_cols in (
-            ("sales", [("logged_by", "TEXT"), ("discount", "DOUBLE PRECISION DEFAULT 0"),
-                       ("gross_price", "DOUBLE PRECISION"), ("payment_method", "TEXT")]),
-            ("subscriptions", [("logged_by", "TEXT"), ("discount", "DOUBLE PRECISION DEFAULT 0"),
-                                ("gross_price", "DOUBLE PRECISION"), ("payment_method", "TEXT")]),
+            ("sales", common_cols),
+            ("subscriptions", common_cols + sub_only_cols),
         ):
             for col_name, col_type in new_cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+            # new rows get a timestamp automatically; old rows stay NULL on purpose
+            # (so /undo never touches history it can't date)
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN created_at SET DEFAULT now()")
         conn.execute("UPDATE sales SET gross_price = sold_price + COALESCE(discount,0) WHERE gross_price IS NULL")
         conn.execute(
             "UPDATE subscriptions SET gross_price = sold_price + COALESCE(discount,0) WHERE gross_price IS NULL"
+        )
+        # everything logged before payment tracking existed is treated as fully paid
+        conn.execute("UPDATE sales SET amount_paid = sold_price WHERE amount_paid IS NULL")
+        conn.execute("UPDATE subscriptions SET amount_paid = sold_price WHERE amount_paid IS NULL")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS products_kind_name_idx ON products (kind, LOWER(name))"
         )
         conn.commit()
 
@@ -124,23 +149,34 @@ def get_owner_chat_id():
 
 # ---------- sales ----------
 
+def _iso(d):
+    """Accept a date, a 'YYYY-MM-DD' string, or None (-> today) and return an ISO string."""
+    if d is None:
+        return date.today().isoformat()
+    return d.isoformat() if hasattr(d, "isoformat") else str(d)
+
+
 def add_sale(item, customer, sold_price, cost_price, logged_by=None,
-             discount=0.0, gross_price=None, payment_method=None):
+             discount=0.0, gross_price=None, payment_method=None,
+             sale_date=None, seller=None, supplier=None, amount_paid=None):
     """
     sold_price = final/net amount actually received (after discount).
     gross_price = list price before discount; if not given, computed as sold_price + discount.
+    amount_paid = money actually collected so far; defaults to sold_price (fully paid).
     """
     if gross_price is None:
         gross_price = sold_price + discount
+    if amount_paid is None:
+        amount_paid = sold_price
     profit = sold_price - cost_price
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO sales "
             "(item, customer, sold_price, cost_price, profit, sale_date, logged_by, "
-            " discount, gross_price, payment_method) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-            (item, customer, sold_price, cost_price, profit, date.today().isoformat(), logged_by,
-             discount, gross_price, payment_method),
+            " discount, gross_price, payment_method, seller, supplier, amount_paid) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (item, customer, sold_price, cost_price, profit, _iso(sale_date), logged_by,
+             discount, gross_price, payment_method, seller, supplier, amount_paid),
         )
         new_id = cur.fetchone()["id"]
         conn.commit()
@@ -153,11 +189,16 @@ def get_sale(sale_id):
 
 
 def update_sale(sale_id, sold_price, cost_price):
+    """Fix price/cost. A fully-paid sale stays fully paid at the new price; a part-paid
+    one keeps what was received (capped at the new price)."""
     profit = sold_price - cost_price
     with get_conn() as conn:
         conn.execute(
-            "UPDATE sales SET sold_price=%s, cost_price=%s, profit=%s WHERE id=%s",
-            (sold_price, cost_price, profit, sale_id),
+            "UPDATE sales SET "
+            "amount_paid = CASE WHEN COALESCE(amount_paid, sold_price) >= sold_price THEN %s "
+            "                   ELSE LEAST(amount_paid, %s) END, "
+            "sold_price=%s, cost_price=%s, profit=%s WHERE id=%s",
+            (sold_price, sold_price, sold_price, cost_price, profit, sale_id),
         )
         conn.commit()
     return profit
@@ -263,20 +304,23 @@ def discount_summary(since_date: str = None):
 # ---------- subscriptions ----------
 
 def add_subscription(customer, item, sold_price, cost_price, start_date: date, duration_days: int,
-                      logged_by=None, discount=0.0, gross_price=None, payment_method=None):
+                      logged_by=None, discount=0.0, gross_price=None, payment_method=None,
+                      seller=None, supplier=None, amount_paid=None, phone=None):
     end_date = start_date.fromordinal(start_date.toordinal() + duration_days)
     if gross_price is None:
         gross_price = sold_price + discount
+    if amount_paid is None:
+        amount_paid = sold_price
     profit = sold_price - cost_price
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO subscriptions "
             "(customer, item, sold_price, cost_price, profit, start_date, end_date, logged_by, "
-            " discount, gross_price, payment_method) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            " discount, gross_price, payment_method, seller, supplier, amount_paid, phone) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (customer, item, sold_price, cost_price, profit,
              start_date.isoformat(), end_date.isoformat(), logged_by,
-             discount, gross_price, payment_method),
+             discount, gross_price, payment_method, seller, supplier, amount_paid, phone),
         )
         new_id = cur.fetchone()["id"]
         conn.commit()
@@ -292,8 +336,11 @@ def update_subscription(sub_id, sold_price, cost_price):
     profit = sold_price - cost_price
     with get_conn() as conn:
         conn.execute(
-            "UPDATE subscriptions SET sold_price=%s, cost_price=%s, profit=%s WHERE id=%s",
-            (sold_price, cost_price, profit, sub_id),
+            "UPDATE subscriptions SET "
+            "amount_paid = CASE WHEN COALESCE(amount_paid, sold_price) >= sold_price THEN %s "
+            "                   ELSE LEAST(amount_paid, %s) END, "
+            "sold_price=%s, cost_price=%s, profit=%s WHERE id=%s",
+            (sold_price, sold_price, sold_price, cost_price, profit, sub_id),
         )
         conn.commit()
     return profit
@@ -631,8 +678,9 @@ def renewal_churn_stats(grace_days: int = 30):
     for old in ended:
         old_end = date.fromisoformat(old["end_date"])
         cutoff = old_end.fromordinal(old_end.toordinal() + grace_days)
-        found = False
-        for other in all_subs:
+        # a one-tap /renew links old -> new directly, which is more reliable than guessing by dates
+        found = bool(old.get("renewed_to"))
+        for other in ([] if found else all_subs):
             if other["id"] == old["id"]:
                 continue
             if (other["customer"] or "").strip().lower() != (old["customer"] or "").strip().lower():
@@ -678,9 +726,353 @@ def full_backup_dict():
         subs = conn.execute("SELECT * FROM subscriptions ORDER BY id").fetchall()
         staff = conn.execute("SELECT * FROM staff ORDER BY user_id").fetchall()
         settings = conn.execute("SELECT * FROM settings").fetchall()
+        products = conn.execute("SELECT * FROM products ORDER BY id").fetchall()
     return {
         "sales": [dict(r) for r in sales],
         "subscriptions": [dict(r) for r in subs],
         "staff": [dict(r) for r in staff],
+        "products": [dict(r) for r in products],
         "settings": {r["key"]: r["value"] for r in settings},
     }
+
+
+# =====================================================================
+# Seller / supplier / dues / expiring / renew / undo / catalog
+# =====================================================================
+
+def _recent_values(column: str, limit: int):
+    """Most recently used distinct non-empty values of sales/subscriptions.<column>."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT v, MAX(d) AS last_used FROM (
+                SELECT {column} AS v, sale_date AS d FROM sales WHERE COALESCE({column}, '') <> ''
+                UNION ALL
+                SELECT {column} AS v, start_date AS d FROM subscriptions WHERE COALESCE({column}, '') <> ''
+            ) t
+            GROUP BY v
+            ORDER BY last_used DESC, v ASC
+            LIMIT %s
+            """,
+            (limit,),
+        ).fetchall()
+    return [r["v"] for r in rows]
+
+
+def recent_sellers(limit=6):
+    return _recent_values("seller", limit)
+
+
+def recent_suppliers(limit=6):
+    return _recent_values("supplier", limit)
+
+
+def top_sellers(limit=5):
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT MIN(seller) AS seller, SUM(profit) AS total_profit,
+                   SUM(sold_price) AS total_revenue, COUNT(*) AS deals
+            FROM (
+                SELECT seller, profit, sold_price FROM sales WHERE COALESCE(seller, '') <> ''
+                UNION ALL
+                SELECT seller, profit, sold_price FROM subscriptions WHERE COALESCE(seller, '') <> ''
+            ) t
+            GROUP BY LOWER(seller)
+            ORDER BY total_profit DESC
+            LIMIT %s
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def customer_phone(name: str):
+    """Most recent phone number saved for this customer (case-insensitive), or None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT phone FROM subscriptions WHERE LOWER(customer) = LOWER(%s) "
+            "AND COALESCE(phone, '') <> '' ORDER BY id DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+        return row["phone"] if row else None
+
+
+def set_customer_phone(name: str, phone: str) -> int:
+    """Sets the phone on every subscription of this customer. Returns rows updated."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE subscriptions SET phone=%s WHERE LOWER(customer) = LOWER(%s)", (phone, name)
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+# ---------- payments owed ----------
+
+def dues():
+    """Everything not fully paid. Returns (sales_rows, sub_rows, total_balance)."""
+    with get_conn() as conn:
+        sales = conn.execute(
+            "SELECT *, sold_price - COALESCE(amount_paid, sold_price) AS balance FROM sales "
+            "WHERE sold_price - COALESCE(amount_paid, sold_price) > 0.005 ORDER BY sale_date ASC, id ASC"
+        ).fetchall()
+        subs = conn.execute(
+            "SELECT *, sold_price - COALESCE(amount_paid, sold_price) AS balance FROM subscriptions "
+            "WHERE sold_price - COALESCE(amount_paid, sold_price) > 0.005 ORDER BY start_date ASC, id ASC"
+        ).fetchall()
+    total = sum(r["balance"] for r in sales) + sum(r["balance"] for r in subs)
+    return sales, subs, total
+
+
+def record_payment(kind: str, record_id: int, amount=None):
+    """
+    Record money received against a sale ('sale') or subscription ('sub').
+    amount=None means "the whole remaining balance". The payment is capped at the balance.
+    Returns dict(sold, paid, balance, applied) or None if the record doesn't exist.
+    """
+    table = "sales" if kind == "sale" else "subscriptions"
+    with get_conn() as conn:
+        row = conn.execute(f"SELECT sold_price, amount_paid FROM {table} WHERE id=%s", (record_id,)).fetchone()
+        if not row:
+            return None
+        sold = row["sold_price"]
+        paid_before = row["amount_paid"] if row["amount_paid"] is not None else sold
+        balance_before = max(sold - paid_before, 0.0)
+        applied = balance_before if amount is None else min(max(amount, 0.0), balance_before)
+        paid_after = paid_before + applied
+        conn.execute(f"UPDATE {table} SET amount_paid=%s WHERE id=%s", (paid_after, record_id))
+        conn.commit()
+    return {"sold": sold, "paid": paid_after, "balance": max(sold - paid_after, 0.0), "applied": applied}
+
+
+# ---------- expiring / renew ----------
+
+def expiring_subs(days: int, today: date = None):
+    """Active subscriptions ending within `days` days (including already-overdue ones)."""
+    today = today or date.today()
+    limit = today.fromordinal(today.toordinal() + days).isoformat()
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM subscriptions WHERE active=1 AND end_date <= %s ORDER BY end_date ASC, id ASC",
+            (limit,),
+        ).fetchall()
+
+
+LIFETIME_THRESHOLD_DAYS = 3650  # keep in sync with main.py: 10+ years == "lifetime"
+
+
+def renew_subscription(sub_id: int, paid: bool = True, logged_by=None, today: date = None):
+    """
+    Clone a subscription for another term, same price/cost/seller/supplier/phone.
+    The new term is sold today. If the old one still has days left, those days are
+    added on, so the customer doesn't lose them by renewing early.
+
+    Returns (status, payload):
+      ("ok", dict(new_id, old, start, end, duration, extra_days, profit))
+      ("missing", None) | ("lifetime", None) | ("already", new_id_of_earlier_renewal)
+    """
+    today = today or date.today()
+    old = get_subscription(sub_id)
+    if not old:
+        return "missing", None
+    if old.get("renewed_to"):
+        return "already", old["renewed_to"]
+
+    old_start = date.fromisoformat(old["start_date"])
+    old_end = date.fromisoformat(old["end_date"])
+    term_days = (old_end - old_start).days
+    if term_days >= LIFETIME_THRESHOLD_DAYS:
+        return "lifetime", None
+
+    extra = max(0, (old_end - today).days)
+    duration = term_days + extra
+    sold = old["sold_price"]
+    new_id, end_date, profit = add_subscription(
+        old["customer"], old["item"], sold, old["cost_price"], today, duration,
+        logged_by=logged_by, discount=old["discount"] or 0.0, gross_price=old["gross_price"],
+        payment_method=old["payment_method"], seller=old["seller"], supplier=old["supplier"],
+        amount_paid=sold if paid else 0.0, phone=old["phone"],
+    )
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE subscriptions SET renewed_to=%s, active=0, reminded_due=1 "
+            "WHERE id=%s AND renewed_to IS NULL",
+            (new_id, sub_id),
+        )
+        if cur.rowcount == 0:  # someone renewed it a split second earlier -> undo our duplicate
+            conn.execute("DELETE FROM subscriptions WHERE id=%s", (new_id,))
+            conn.commit()
+            return "already", get_subscription(sub_id)["renewed_to"]
+        conn.commit()
+    return "ok", {
+        "new_id": new_id, "old": old, "start": today, "end": end_date,
+        "duration": duration, "extra_days": extra, "profit": profit,
+    }
+
+
+# ---------- undo ----------
+
+def latest_entry_by(logged_by: str, within_hours: int = 24):
+    """
+    The most recent sale/subscription this person logged in the last `within_hours`.
+    Returns ("sale"|"sub", row) or None. Rows logged before timestamps existed are ignored.
+    """
+    with get_conn() as conn:
+        sale = conn.execute(
+            "SELECT * FROM sales WHERE logged_by=%s AND created_at IS NOT NULL "
+            "AND created_at > now() - make_interval(hours => %s) ORDER BY created_at DESC, id DESC LIMIT 1",
+            (logged_by, within_hours),
+        ).fetchone()
+        sub = conn.execute(
+            "SELECT * FROM subscriptions WHERE logged_by=%s AND created_at IS NOT NULL "
+            "AND created_at > now() - make_interval(hours => %s) ORDER BY created_at DESC, id DESC LIMIT 1",
+            (logged_by, within_hours),
+        ).fetchone()
+    if sale and sub:
+        return ("sale", sale) if sale["created_at"] >= sub["created_at"] else ("sub", sub)
+    if sale:
+        return "sale", sale
+    if sub:
+        return "sub", sub
+    return None
+
+
+def is_renewal_target(sub_id: int) -> bool:
+    """True if this subscription was created by renewing an earlier one."""
+    with get_conn() as conn:
+        return conn.execute("SELECT 1 FROM subscriptions WHERE renewed_to=%s", (sub_id,)).fetchone() is not None
+
+
+def undo_subscription(sub_id: int) -> bool:
+    """Delete a subscription; if it was created by a one-tap renewal, reopen the original."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE subscriptions SET renewed_to=NULL, active=1, reminded_due=0 WHERE renewed_to=%s",
+            (sub_id,),
+        )
+        cur = conn.execute("DELETE FROM subscriptions WHERE id=%s", (sub_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# ---------- suppliers ----------
+
+def supplier_report():
+    """
+    Returns dict(suppliers=[...], comparisons=[...]).
+    suppliers: per supplier -> deals, total_cost, revenue, profit, margin_pct (profit / revenue).
+    comparisons: items bought from 2+ suppliers -> avg cost per supplier, cheapest first.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT MIN(supplier) AS supplier, COUNT(*) AS deals, SUM(cost_price) AS total_cost,
+                   SUM(sold_price) AS revenue, SUM(profit) AS profit
+            FROM (
+                SELECT supplier, cost_price, sold_price, profit FROM sales WHERE COALESCE(supplier,'') <> ''
+                UNION ALL
+                SELECT supplier, cost_price, sold_price, profit FROM subscriptions WHERE COALESCE(supplier,'') <> ''
+            ) t
+            GROUP BY LOWER(supplier)
+            ORDER BY profit DESC
+            """
+        ).fetchall()
+        per_item = conn.execute(
+            """
+            SELECT MIN(item) AS item, MIN(supplier) AS supplier, COUNT(*) AS deals, AVG(cost_price) AS avg_cost
+            FROM (
+                SELECT item, supplier, cost_price FROM sales WHERE COALESCE(supplier,'') <> ''
+                UNION ALL
+                SELECT item, supplier, cost_price FROM subscriptions WHERE COALESCE(supplier,'') <> ''
+            ) t
+            GROUP BY LOWER(item), LOWER(supplier)
+            """
+        ).fetchall()
+
+    suppliers = []
+    for r in rows:
+        revenue = r["revenue"] or 0.0
+        suppliers.append({
+            "supplier": r["supplier"], "deals": r["deals"], "total_cost": r["total_cost"],
+            "revenue": revenue, "profit": r["profit"],
+            "margin_pct": (r["profit"] / revenue * 100) if revenue > 0 else 0.0,
+        })
+
+    by_item = {}
+    for r in per_item:
+        by_item.setdefault(r["item"].lower(), {"item": r["item"], "options": []})["options"].append(
+            {"supplier": r["supplier"], "avg_cost": r["avg_cost"], "deals": r["deals"]}
+        )
+    comparisons = []
+    for entry in by_item.values():
+        if len(entry["options"]) >= 2:
+            entry["options"].sort(key=lambda o: o["avg_cost"])
+            comparisons.append(entry)
+    comparisons.sort(key=lambda e: e["item"].lower())
+    return {"suppliers": suppliers, "comparisons": comparisons}
+
+
+# ---------- period totals (morning summary) ----------
+
+def period_totals(start_iso: str, end_iso: str):
+    """Sales by sale_date and subscriptions by start_date, inclusive range of ISO date strings."""
+    with get_conn() as conn:
+        s = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(sold_price),0) AS revenue, COALESCE(SUM(profit),0) AS profit "
+            "FROM sales WHERE sale_date >= %s AND sale_date <= %s", (start_iso, end_iso)
+        ).fetchone()
+        u = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(sold_price),0) AS revenue, COALESCE(SUM(profit),0) AS profit "
+            "FROM subscriptions WHERE start_date >= %s AND start_date <= %s", (start_iso, end_iso)
+        ).fetchone()
+    return {
+        "sales_n": s["n"], "subs_n": u["n"],
+        "revenue": s["revenue"] + u["revenue"], "profit": s["profit"] + u["profit"],
+    }
+
+
+# ---------- product catalog ----------
+
+def save_product(kind: str, name: str, price, cost, duration, supplier):
+    """Create, or update if a product with the same kind+name already exists. Returns (id, created)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM products WHERE kind=%s AND LOWER(name)=LOWER(%s)", (kind, name)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE products SET name=%s, default_price=%s, default_cost=%s, default_duration=%s, "
+                "default_supplier=%s WHERE id=%s",
+                (name, price, cost, duration, supplier, row["id"]),
+            )
+            conn.commit()
+            return row["id"], False
+        cur = conn.execute(
+            "INSERT INTO products (kind, name, default_price, default_cost, default_duration, default_supplier) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (kind, name, price, cost, duration, supplier),
+        )
+        new_id = cur.fetchone()["id"]
+        conn.commit()
+        return new_id, True
+
+
+def list_products(kind=None):
+    with get_conn() as conn:
+        if kind:
+            return conn.execute(
+                "SELECT * FROM products WHERE kind=%s ORDER BY LOWER(name)", (kind,)
+            ).fetchall()
+        return conn.execute("SELECT * FROM products ORDER BY kind, LOWER(name)").fetchall()
+
+
+def get_product(product_id: int):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM products WHERE id=%s", (product_id,)).fetchone()
+
+
+def delete_product(product_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM products WHERE id=%s", (product_id,))
+        conn.commit()
+        return cur.rowcount > 0
