@@ -20,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 
+import assign
 import db
 import flow
 import sheets
@@ -71,6 +72,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 /customer &lt;name&gt; · 🔍 /search &lt;keyword&gt;\n\n"
         "<b>Setup</b>\n"
         "📦 /products · /addproduct · /delproduct\n"
+        "🧑‍💼 /assignseller · /setseller (add sellers to older entries)\n"
         "📤 /export · 💾 /backup · 📊 /syncsheets\n"
         "🛠 /editsale, /deletesale, /editsub, /deletesub\n"
         "👥 /myid, /addstaff, /removestaff, /staff\n"
@@ -366,6 +368,9 @@ async def subs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• #{r['id']} <b>{esc(r['customer'])}</b> — {esc(r['item'])} — {when} — "
             f"profit {r['profit']:.2f}{_tags(r)}"
         )
+    missing = sum(1 for r in rows if not r.get("seller"))
+    if missing:
+        lines.append(f"\n🧑‍💼 {missing} of these have no seller yet — /assignseller")
     await reply_long(update, "\n".join(lines))
 
 
@@ -1156,6 +1161,8 @@ COMMAND_MENU = [
     ("products", "Saved products"),
     ("addproduct", "Save a product/plan (owner)"),
     ("setphone", "Save a customer's phone number"),
+    ("assignseller", "Add sellers to older entries (owner)"),
+    ("setseller", "Set a seller on specific entries (owner)"),
     ("export", "Download CSV export"),
     ("backup", "Download database backup"),
     ("syncsheets", "Push all data to Google Sheets"),
@@ -1198,6 +1205,8 @@ def build_app() -> Application:
 
     # the three step-by-step forms (/newsale, /newsub, /addproduct) share one conversation
     app.add_handler(flow.build_conversation())
+    app.add_handler(assign.build_conversation())
+    app.add_handler(CommandHandler("setseller", assign.setseller_cmd))
 
     app.add_handler(CommandHandler("subs", subs_cmd))
     app.add_handler(CommandHandler("sales", sales_cmd))
@@ -1255,7 +1264,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cancel_idle))
 
     # last resort: taps on buttons of a form that already finished (must come after the conversation)
-    app.add_handler(CallbackQueryHandler(_stale_form_button, pattern=r"^(f|cf):"))
+    app.add_handler(CallbackQueryHandler(_stale_form_button, pattern=r"^(f|cf|as|asall):"))
 
     # daily jobs -- times are in TIMEZONE (the scheduler itself defaults to UTC, so be explicit)
     app.job_queue.run_daily(
