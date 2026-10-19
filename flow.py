@@ -745,7 +745,7 @@ async def flow_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def stale_form_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Catches taps on buttons from a form that already finished (or from before a restart)."""
-    await ack(update, "This form already finished — start a new one with /newsale or /newsub.", alert=True)
+    await ack(update, "That screen has expired — start again from /menu.", alert=True)
 
 
 def build_conversation() -> ConversationHandler:
