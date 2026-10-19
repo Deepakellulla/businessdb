@@ -26,6 +26,11 @@ automatically reminds you before — and when — a subscription ends.
 - **Reminder messages** (3 days before, and when it ends) now come with 🔁 *Renew (paid)* / 🕓 *Renew (pay later)* buttons and a 💬 *WhatsApp the customer* button that opens a chat with the renewal message already typed.
 - `/setphone Alice Smith 9876543210` — add a phone number to a customer's existing subscriptions.
 
+**Adding sellers to older entries** (owner only)
+- `/assignseller` — walks through subscriptions that have no seller, oldest first, one at a time: tap a seller, type a new name, or skip. If a customer has several unassigned entries, it asks whether to give them all the same seller. `/assignseller sales` does the same for sales. Your Google Sheet updates when you finish or tap Stop; a session ends by itself after 10 idle minutes.
+- `/setseller sub 5,6,9-12 Ravi` — set one seller on specific entries in one go (IDs from `/subs`; `sale` instead of `sub` for sales; use `-` as the name to clear a seller).
+- `/subs` tells you how many active subscriptions still have no seller.
+
 **Reports**
 - `/summary` — yesterday's sales and profit, this month so far, what's expiring this week, what you're owed. **Also sent to you automatically every morning** (08:00 by default).
 - `/stats` · `/monthly` (`/monthly 12`, `/monthly 2026-05`) · `/top` (customers, products, sellers) · `/abc` · `/renewal`
