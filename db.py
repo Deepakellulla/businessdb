@@ -1076,3 +1076,68 @@ def delete_product(product_id: int) -> bool:
         cur = conn.execute("DELETE FROM products WHERE id=%s", (product_id,))
         conn.commit()
         return cur.rowcount > 0
+
+
+# ---------- assigning sellers to existing records ----------
+
+def _seller_table(kind: str):
+    return ("sales", "sale_date") if kind == "sale" else ("subscriptions", "start_date")
+
+
+def set_seller(kind: str, ids, seller):
+    """Set (or clear, with seller=None) the seller on the given ids. Returns the ids that existed."""
+    table, _ = _seller_table(kind)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE {table} SET seller=%s WHERE id = ANY(%s) RETURNING id", (seller, list(ids))
+        )
+        found = sorted(r["id"] for r in cur.fetchall())
+        conn.commit()
+    return found
+
+
+def next_unassigned(kind: str, skip_ids=()):
+    """Oldest record with no seller (ignoring skip_ids). Returns (row or None, how many are left)."""
+    table, _ = _seller_table(kind)
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE COALESCE(seller, '') = '' AND NOT (id = ANY(%s)) "
+            f"ORDER BY id ASC LIMIT 1", (list(skip_ids),)
+        ).fetchone()
+        left = conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE COALESCE(seller, '') = '' AND NOT (id = ANY(%s))",
+            (list(skip_ids),),
+        ).fetchone()["n"]
+    return row, left
+
+
+def count_unassigned(kind: str) -> int:
+    table, _ = _seller_table(kind)
+    with get_conn() as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE COALESCE(seller, '') = ''"
+        ).fetchone()["n"]
+
+
+def count_unassigned_for_customer(kind: str, customer: str, exclude_ids=()) -> int:
+    table, _ = _seller_table(kind)
+    with get_conn() as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE LOWER(customer) = LOWER(%s) "
+            f"AND COALESCE(seller, '') = '' AND NOT (id = ANY(%s))",
+            (customer, list(exclude_ids)),
+        ).fetchone()["n"]
+
+
+def assign_customer_unassigned(kind: str, customer: str, seller: str, exclude_ids=()):
+    """Give `seller` to every still-unassigned record of this customer. Returns the ids changed."""
+    table, _ = _seller_table(kind)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE {table} SET seller=%s WHERE LOWER(customer) = LOWER(%s) "
+            f"AND COALESCE(seller, '') = '' AND NOT (id = ANY(%s)) RETURNING id",
+            (seller, customer, list(exclude_ids)),
+        )
+        ids = sorted(r["id"] for r in cur.fetchall())
+        conn.commit()
+    return ids
