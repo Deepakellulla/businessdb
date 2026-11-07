@@ -346,6 +346,78 @@ def update_subscription(sub_id, sold_price, cost_price):
     return profit
 
 
+# ---------- generic field editor (used by the /editsale and /editsub screens) ----------
+
+_EDITABLE = {
+    "sale": ("sales", {
+        "item", "customer", "sale_date", "sold_price", "cost_price", "discount",
+        "payment_method", "amount_paid", "seller", "supplier",
+    }),
+    "sub": ("subscriptions", {
+        "item", "customer", "phone", "start_date", "end_date", "sold_price", "cost_price",
+        "discount", "payment_method", "amount_paid", "seller", "supplier",
+    }),
+}
+
+
+def get_entry(kind, entry_id):
+    """kind is 'sale' or 'sub'."""
+    table = _EDITABLE[kind][0]
+    with get_conn() as conn:
+        return conn.execute(f"SELECT * FROM {table} WHERE id=%s", (entry_id,)).fetchone()
+
+
+def update_entry(kind, entry_id, changes: dict):
+    """
+    Change any editable fields of a sale/subscription and keep the derived columns consistent:
+      * profit        = sold_price - cost_price
+      * gross_price   = sold_price + discount
+      * amount_paid   : a fully-paid entry stays fully paid when the price changes; a part-paid
+                        one keeps what was received (capped at the new price)
+      * end_date (subscriptions): reminders are re-armed for a future date, or the entry is
+                        marked as ended (no surprise reminder) for a past date
+    Returns the updated row, or None if the id doesn't exist.
+    """
+    table, allowed = _EDITABLE[kind]
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"Not editable: {', '.join(sorted(unknown))}")
+    if not changes:
+        return get_entry(kind, entry_id)
+
+    with get_conn() as conn:
+        old = conn.execute(f"SELECT * FROM {table} WHERE id=%s", (entry_id,)).fetchone()
+        if not old:
+            return None
+        new = dict(old)
+        new.update(changes)
+        sets = dict(changes)
+
+        if "sold_price" in changes or "cost_price" in changes:
+            sets["profit"] = new["sold_price"] - new["cost_price"]
+        if "sold_price" in changes or "discount" in changes:
+            sets["gross_price"] = new["sold_price"] + (new.get("discount") or 0)
+        if "sold_price" in changes and "amount_paid" not in changes:
+            old_paid = old["amount_paid"] if old["amount_paid"] is not None else old["sold_price"]
+            if old_paid >= old["sold_price"]:
+                sets["amount_paid"] = changes["sold_price"]
+            else:
+                sets["amount_paid"] = min(old_paid, changes["sold_price"])
+        if kind == "sub" and "end_date" in changes and not old.get("renewed_to"):
+            if changes["end_date"] >= date.today().isoformat():
+                sets.update(reminded_soon=0, reminded_due=0, active=1)
+            else:
+                sets.update(reminded_soon=1, reminded_due=1, active=0)
+
+        assignments = ", ".join(f"{col}=%s" for col in sets)  # column names come from the whitelist above
+        conn.execute(
+            f"UPDATE {table} SET {assignments} WHERE id=%s",
+            (*sets.values(), entry_id),
+        )
+        conn.commit()
+        return conn.execute(f"SELECT * FROM {table} WHERE id=%s", (entry_id,)).fetchone()
+
+
 def delete_subscription(sub_id):
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM subscriptions WHERE id=%s", (sub_id,))
