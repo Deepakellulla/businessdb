@@ -14,14 +14,13 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ConversationHandler,
-    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters,
 )
 
 import assign
 import db
+import editentry
 import flow
 import sheets
 from config import (
@@ -37,10 +36,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# ---------- conversation states for the (separate) edit flows ----------
-EDIT_SALE_PRICE, EDIT_SALE_COST = range(2)
-EDIT_SUB_PRICE, EDIT_SUB_COST = range(2, 4)
 
 _is_lifetime_duration = is_lifetime_duration  # short alias used by the list views below
 
@@ -74,7 +69,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📦 /products · /addproduct · /delproduct\n"
         "🧑‍💼 /assignseller · /setseller (add sellers to older entries)\n"
         "📤 /export · 💾 /backup · 📊 /syncsheets\n"
-        "🛠 /editsale, /deletesale, /editsub, /deletesub\n"
+        "🛠 /edit, /editsale, /deletesale, /editsub, /deletesub\n"
         "👥 /myid, /addstaff, /removestaff, /staff\n"
         "❌ /cancel — cancel current input",
     )
@@ -198,55 +193,24 @@ async def staff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# ================= /edit helper & global error handler =================
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    """Log every unhandled exception and tell the user instead of staying silent."""
+    logger.error("Unhandled error while handling an update", exc_info=context.error)
+    if isinstance(update, Update):
+        try:
+            if update.callback_query:
+                await update.callback_query.answer("⚠️ Something went wrong.", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(
+                    "⚠️ Something went wrong. The error was logged — please try again."
+                )
+        except Exception:
+            logger.exception("Could not send the error message to the user")
+
+
 # ================= edit / delete sale =================
-
-async def editsale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_auth(update):
-        return ConversationHandler.END
-    if not context.args:
-        await reply_to(update, "Usage: <code>/editsale &lt;id&gt;</code>  (see IDs via /sales)")
-        return ConversationHandler.END
-    try:
-        sale_id = int(context.args[0])
-    except ValueError:
-        await reply_to(update, "ID must be a number.")
-        return ConversationHandler.END
-    sale = db.get_sale(sale_id)
-    if not sale:
-        await reply_to(update, f"No sale with ID {sale_id}.")
-        return ConversationHandler.END
-    context.user_data["edit_sale_id"] = sale_id
-    await reply_to(
-        update,
-        f"✏️ Editing sale #{sale_id} (<b>{esc(sale['item'])}</b>). "
-        f"Current sold price: {sale['sold_price']:.2f}\nSend the new sold price:",
-    )
-    return EDIT_SALE_PRICE
-
-
-async def editsale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["new_sold_price"] = float(update.message.text.strip())
-    except ValueError:
-        await reply_to(update, "Please send a valid number.")
-        return EDIT_SALE_PRICE
-    await reply_to(update, "Send the new cost price:")
-    return EDIT_SALE_COST
-
-
-async def editsale_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        cost_price = float(update.message.text.strip())
-    except ValueError:
-        await reply_to(update, "Please send a valid number.")
-        return EDIT_SALE_COST
-    sale_id = context.user_data["edit_sale_id"]
-    profit = db.update_sale(sale_id, context.user_data["new_sold_price"], cost_price)
-    resync_sheets_in_background()
-    await reply_to(update, f"✅ Sale #{sale_id} updated. New profit: <b>{profit:.2f}</b>")
-    context.user_data.clear()
-    return ConversationHandler.END
-
 
 async def deletesale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth(update):
@@ -266,54 +230,6 @@ async def deletesale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ================= edit / delete subscription =================
-
-async def editsub_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_auth(update):
-        return ConversationHandler.END
-    if not context.args:
-        await reply_to(update, "Usage: <code>/editsub &lt;id&gt;</code>  (see IDs via /subs)")
-        return ConversationHandler.END
-    try:
-        sub_id = int(context.args[0])
-    except ValueError:
-        await reply_to(update, "ID must be a number.")
-        return ConversationHandler.END
-    sub = db.get_subscription(sub_id)
-    if not sub:
-        await reply_to(update, f"No subscription with ID {sub_id}.")
-        return ConversationHandler.END
-    context.user_data["edit_sub_id"] = sub_id
-    await reply_to(
-        update,
-        f"✏️ Editing subscription #{sub_id} (<b>{esc(sub['item'])}</b> — {esc(sub['customer'])}). "
-        f"Current price: {sub['sold_price']:.2f}\nSend the new price:",
-    )
-    return EDIT_SUB_PRICE
-
-
-async def editsub_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["new_sold_price"] = float(update.message.text.strip())
-    except ValueError:
-        await reply_to(update, "Please send a valid number.")
-        return EDIT_SUB_PRICE
-    await reply_to(update, "Send the new cost price:")
-    return EDIT_SUB_COST
-
-
-async def editsub_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        cost_price = float(update.message.text.strip())
-    except ValueError:
-        await reply_to(update, "Please send a valid number.")
-        return EDIT_SUB_COST
-    sub_id = context.user_data["edit_sub_id"]
-    profit = db.update_subscription(sub_id, context.user_data["new_sold_price"], cost_price)
-    resync_sheets_in_background()
-    await reply_to(update, f"✅ Subscription #{sub_id} updated. New profit: <b>{profit:.2f}</b>")
-    context.user_data.clear()
-    return ConversationHandler.END
-
 
 async def deletesub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth(update):
@@ -1166,9 +1082,10 @@ COMMAND_MENU = [
     ("export", "Download CSV export"),
     ("backup", "Download database backup"),
     ("syncsheets", "Push all data to Google Sheets"),
-    ("editsale", "Correct a sale"),
+    ("edit", "Edit any field of a sale/subscription"),
+    ("editsale", "Edit any field of a sale"),
     ("deletesale", "Remove a sale"),
-    ("editsub", "Correct a subscription"),
+    ("editsub", "Edit any field of a subscription"),
     ("deletesub", "Remove a subscription"),
     ("myid", "Show your Telegram ID"),
     ("addstaff", "Authorize a staff member"),
@@ -1241,30 +1158,16 @@ def build_app() -> Application:
         pattern="^menu:(stats|monthly|subs|sales|top|abc|renewal|export|backup|summary|dues|expiring|undo|suppliers)$",
     ))
 
-    editsale_conv = ConversationHandler(
-        entry_points=[CommandHandler("editsale", editsale_start)],
-        states={
-            EDIT_SALE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, editsale_price)],
-            EDIT_SALE_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, editsale_cost)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(editsale_conv)
-
-    editsub_conv = ConversationHandler(
-        entry_points=[CommandHandler("editsub", editsub_start)],
-        states={
-            EDIT_SUB_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, editsub_price)],
-            EDIT_SUB_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, editsub_cost)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(editsub_conv)
+    # field-by-field editor: /editsale <id>, /editsub <id>, /edit sale|sub <id>
+    app.add_handler(editentry.build_conversation())
 
     app.add_handler(CommandHandler("cancel", cancel_idle))
 
+    app.add_error_handler(on_error)
+
     # last resort: taps on buttons of a form that already finished (must come after the conversation)
     app.add_handler(CallbackQueryHandler(_stale_form_button, pattern=r"^(f|cf|as|asall):"))
+    app.add_handler(editentry.stale_handler())
 
     # daily jobs -- times are in TIMEZONE (the scheduler itself defaults to UTC, so be explicit)
     app.job_queue.run_daily(
