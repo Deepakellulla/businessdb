@@ -43,7 +43,8 @@ automatically reminds you before — and when — a subscription ends.
 
 **Data**
 - `/export` (CSV) · `/backup` (JSON, includes products) · `/syncsheets` (see Google Sheets below)
-- `/editsale <id>` / `/deletesale <id>` / `/editsub <id>` / `/deletesub <id>` — fix price/cost, or remove an entry (find IDs in `/sales`, `/subs`, `/dues`)
+- `/editsale <id>` / `/editsub <id>` (or `/edit sale <id>` / `/edit sub <id>`) — open an entry and change **any field** (item, customer, date, prices, discount, payment method, amount paid, seller, supplier; for subscriptions also phone, start and end date). Tap a field, send the new value, repeat, then tap Done. Profit, gross price and the paid/due amount are recalculated automatically.
+- `/deletesale <id>` / `/deletesub <id>` — remove an entry (find IDs in `/sales`, `/subs`, `/dues`)
 - `/menu` — everything above as tappable buttons
 
 ### Payment method & discounts
