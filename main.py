@@ -23,13 +23,15 @@ import db
 import editentry
 import flow
 import sheets
+import tgsync
 from config import (
     BOT_TOKEN, REMINDER_HOUR, REMINDER_MINUTE, REMINDER_DAYS_BEFORE,
-    MORNING_SUMMARY_HOUR, MORNING_SUMMARY_MINUTE, TIMEZONE, TZINFO,
+    MORNING_SUMMARY_HOUR, MORNING_SUMMARY_MINUTE, TG_SYNC_HOUR, TG_SYNC_MINUTE, TIMEZONE, TZINFO,
 )
 from helpers import (
     ack, display_name, esc, is_lifetime_duration, money, normalize_phone,
-    reply_document_to, reply_long, reply_to, require_auth, resync_sheets_in_background, whatsapp_link,
+    reply_document_to, reply_long, reply_to, require_auth, resync_sheets_in_background, telegram_link,
+    whatsapp_link,
 )
 
 logging.basicConfig(
@@ -48,8 +50,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif not db.is_authorized(update.effective_user.id):
         await reply_to(
             update,
-            "👋 Hi! This bot is private. Ask the owner to add you with:\n"
-            f"<code>/addstaff {update.effective_user.id}</code>",
+            "👋 Hi! You're connected — there's nothing you need to do here.\n\n"
+            "<i>Staff member? Send /myid and give that number to the owner so they can add you "
+            "with /addstaff.</i>",
         )
         return
 
@@ -68,7 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Setup</b>\n"
         "📦 /products · /addproduct · /delproduct\n"
         "🧑‍💼 /assignseller · /setseller (add sellers to older entries)\n"
-        "📤 /export · 💾 /backup · 📊 /syncsheets\n"
+        "📤 /export · 💾 /backup · 📊 /syncsheets · ✈️ /syncusernames\n"
         "🛠 /edit, /editsale, /deletesale, /editsub, /deletesub\n"
         "👥 /myid, /addstaff, /removestaff, /staff\n"
         "❌ /cancel — cancel current input",
@@ -409,6 +412,12 @@ async def customer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = db.customer_phone(name)
     if phone:
         lines.append(f"📞 +{phone}")
+    tg = db.customer_tg(name)
+    if tg:
+        if tg["tg_username"]:
+            lines.append(f"✈️ @{esc(tg['tg_username'])}" + (f" (ID {tg['tg_id']})" if tg["tg_id"] else ""))
+        else:
+            lines.append(f"✈️ ID {tg['tg_id']} (username not found yet)")
     owed = sum(_balance(r) for r in profile["sales"]) + sum(_balance(r) for r in profile["subscriptions"])
     if owed > 0.005:
         lines.append(f"🔴 <b>Owes you {money(owed)}</b>")
@@ -563,7 +572,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sales:
         sales_csv = _rows_to_csv_bytes(
-            sales, ["id", "sale_date", "item", "customer", "seller", "supplier", "gross_price", "discount",
+            sales, ["id", "sale_date", "item", "customer", "tg_username", "tg_id", "seller", "supplier", "gross_price", "discount",
                     "sold_price", "cost_price", "profit", "amount_paid", "balance_due",
                     "payment_method", "logged_by"]
         )
@@ -578,7 +587,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if subs:
         subs_csv = _rows_to_csv_bytes(
             subs,
-            ["id", "customer", "phone", "item", "seller", "supplier", "gross_price", "discount",
+            ["id", "customer", "phone", "tg_username", "tg_id", "item", "seller", "supplier", "gross_price", "discount",
              "sold_price", "cost_price", "profit", "amount_paid", "balance_due",
              "start_date", "end_date", "active", "payment_method", "logged_by"],
         )
@@ -631,6 +640,29 @@ async def syncsheets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_to(update, f"❌ Sync failed: {esc(str(e))}")
 
 
+async def syncusernames_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run the Telegram username check right now (it also runs by itself every day)."""
+    if not await require_auth(update):
+        return
+    n = len(db.tg_ids_to_check())
+    if n == 0:
+        await reply_to(update, "ℹ️ No Telegram IDs saved yet. Add a customer's numeric ID when logging "
+                               "(or with /editsub) and I'll keep their username up to date.")
+        return
+    await reply_to(update, f"🔄 Checking {n} Telegram ID{'s' if n != 1 else ''}…")
+    result = await tgsync.sync_all(context.bot)
+    lines = [f"✅ Checked <b>{result['checked']}</b> · updated <b>{len(result['changes'])}</b>"]
+    if result["unreachable"]:
+        lines.append(f"👀 {result['unreachable']} can't be seen yet — they need to open this bot and press Start.")
+    if result["errors"]:
+        lines.append(f"⚠️ {result['errors']} couldn't be checked right now (Telegram error) — try again later.")
+    if result["changes"]:
+        lines.append("")
+        lines.append(tgsync._changes_text(result["changes"]))
+        resync_sheets_in_background()
+    await reply_long(update, "\n".join(lines))
+
+
 # ================= dues & payments =================
 
 async def dues_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -645,15 +677,14 @@ async def dues_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             who = esc(r["customer"]) if r["customer"] else "—"
             lines.append(
                 f"• #{r['id']} {who} — {esc(r['item'])} ({r['sale_date']}) — "
-                f"<b>{money(r['balance'])}</b> of {money(r['sold_price'])}"
+                f"<b>{money(r['balance'])}</b> of {money(r['sold_price'])}{_contact(r)}"
             )
     if subs:
         lines.append("\n📋 <b>Subscriptions</b>")
         for r in subs:
-            phone = f" · 📞 +{r['phone']}" if r.get("phone") else ""
             lines.append(
                 f"• #{r['id']} {esc(r['customer'])} — {esc(r['item'])} ({r['start_date']}) — "
-                f"<b>{money(r['balance'])}</b> of {money(r['sold_price'])}{phone}"
+                f"<b>{money(r['balance'])}</b> of {money(r['sold_price'])}{_contact(r)}"
             )
     lines.append(
         "\n💰 Record a payment: <code>/receive sale 12 500</code> or <code>/receive sub 5</code> "
@@ -729,13 +760,19 @@ async def expiring_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             when = "ends <b>today</b>"
         else:
             when = f"ends {r['end_date']} ({left}d)"
-        phone = f" · 📞 +{r['phone']}" if r.get("phone") else ""
-        lines.append(f"• #{r['id']} <b>{esc(r['customer'])}</b> — {esc(r['item'])} — {when}{phone}{_tags(r)}")
-        if r.get("phone") and len(buttons) < 8:
-            buttons.append([InlineKeyboardButton(
+        lines.append(f"• #{r['id']} <b>{esc(r['customer'])}</b> — {esc(r['item'])} — {when}{_contact(r)}{_tags(r)}")
+        contact_row = []
+        if r.get("phone"):
+            contact_row.append(InlineKeyboardButton(
                 f"💬 {r['customer'][:22]}",
                 url=whatsapp_link(r["phone"], r["customer"], r["item"], r["end_date"]),
-            )])
+            ))
+        if r.get("tg_username"):
+            contact_row.append(InlineKeyboardButton(
+                f"✈️ {r['customer'][:22]}", url=telegram_link(r["tg_username"]),
+            ))
+        if contact_row and len(buttons) < 8:
+            buttons.append(contact_row)
     lines.append("\n🔁 Renew with <code>/renew &lt;id&gt;</code> (add <code>due</code> if they haven't paid yet).")
     await reply_long(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
@@ -1006,6 +1043,18 @@ async def morning_summary(context: ContextTypes.DEFAULT_TYPE):
 
 # ================= reminder job =================
 
+def _contact(r) -> str:
+    """' · 📞 +91… · ✈️ @alice' for list views (empty when the customer has neither)."""
+    bits = []
+    if r.get("phone"):
+        bits.append(f"📞 +{r['phone']}")
+    if r.get("tg_username"):
+        bits.append(f"✈️ @{esc(r['tg_username'])}")
+    elif r.get("tg_id"):
+        bits.append(f"✈️ ID {r['tg_id']}")
+    return " · " + " · ".join(bits) if bits else ""
+
+
 def _reminder_keyboard(sub) -> InlineKeyboardMarkup:
     rows = [[
         InlineKeyboardButton("🔁 Renew (paid)", callback_data=f"renew:{sub['id']}:paid"),
@@ -1015,6 +1064,10 @@ def _reminder_keyboard(sub) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             "💬 WhatsApp the customer",
             url=whatsapp_link(sub["phone"], sub["customer"], sub["item"], sub["end_date"]),
+        )])
+    if sub.get("tg_username"):
+        rows.append([InlineKeyboardButton(
+            "✈️ Message on Telegram", url=telegram_link(sub["tg_username"]),
         )])
     return InlineKeyboardMarkup(rows)
 
@@ -1082,6 +1135,7 @@ COMMAND_MENU = [
     ("export", "Download CSV export"),
     ("backup", "Download database backup"),
     ("syncsheets", "Push all data to Google Sheets"),
+    ("syncusernames", "Refresh customers' Telegram usernames"),
     ("edit", "Edit any field of a sale/subscription"),
     ("editsale", "Edit any field of a sale"),
     ("deletesale", "Remove a sale"),
@@ -1147,6 +1201,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("syncsheets", syncsheets_cmd))
+    app.add_handler(CommandHandler("syncusernames", syncusernames_cmd))
     app.add_handler(CommandHandler("deletesale", deletesale_cmd))
     app.add_handler(CommandHandler("deletesub", deletesub_cmd))
 
@@ -1173,6 +1228,10 @@ def build_app() -> Application:
     app.job_queue.run_daily(
         check_reminders, time=dtime(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, tzinfo=TZINFO),
     )
+    if TG_SYNC_HOUR >= 0:
+        app.job_queue.run_daily(
+            tgsync.sync_job, time=dtime(hour=TG_SYNC_HOUR, minute=TG_SYNC_MINUTE, tzinfo=TZINFO),
+        )
     if MORNING_SUMMARY_HOUR >= 0:
         app.job_queue.run_daily(
             morning_summary,
