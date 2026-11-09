@@ -12,8 +12,8 @@ automatically reminds you before — and when — a subscription ends.
 ## What it does
 
 **Log**
-- `/newsale` — log a one-time sale. Asks: item (or tap a saved product), customer, **seller**, date (tap Today or type a past date to backfill), price, discount, cost, **supplier**, payment method, **paid / part-paid / unpaid** — then a review screen with ✅ Confirm / 🔁 Start Over / ❌ Cancel. Nothing is saved until you confirm. The review screen warns about loss-making or low-margin sales.
-- `/newsub` — same, for subscriptions, plus the customer's **phone number** and a duration (30 / 90 / 365 days, any number, or **🔓 Lifetime**). Lifetime subscriptions never trigger renewal reminders.
+- `/newsale` — log a one-time sale. Asks: item (or tap a saved product), customer, the customer's **Telegram** (optional — a numeric ID or @username; skipped when there's no customer), **seller**, date (tap Today or type a past date to backfill), price, discount, cost, **supplier**, payment method, **paid / part-paid / unpaid** — then a review screen with ✅ Confirm / 🔁 Start Over / ❌ Cancel. Nothing is saved until you confirm. The review screen warns about loss-making or low-margin sales.
+- `/newsub` — same, for subscriptions, plus the customer's **phone number** and **Telegram** (both optional — tap Skip) and a duration (30 / 90 / 365 days, any number, or **🔓 Lifetime**). Lifetime subscriptions never trigger renewal reminders.
 - `/undo` — took the wrong entry? Deletes the last sale/subscription *you* logged, within the last 24 hours (asks first). Undoing a renewal re-opens the original subscription.
 
 **Money owed**
@@ -43,7 +43,8 @@ automatically reminds you before — and when — a subscription ends.
 
 **Data**
 - `/export` (CSV) · `/backup` (JSON, includes products) · `/syncsheets` (see Google Sheets below)
-- `/editsale <id>` / `/editsub <id>` (or `/edit sale <id>` / `/edit sub <id>`) — open an entry and change **any field** (item, customer, date, prices, discount, payment method, amount paid, seller, supplier; for subscriptions also phone, start and end date). Tap a field, send the new value, repeat, then tap Done. Profit, gross price and the paid/due amount are recalculated automatically.
+- `/syncusernames` — re-check every saved Telegram ID right now and update any changed usernames (see *Customers' Telegram* below)
+- `/editsale <id>` / `/editsub <id>` (or `/edit sale <id>` / `/edit sub <id>`) — open an entry and change **any field** (item, customer, Telegram username, date, prices, discount, payment method, amount paid, seller, supplier; for subscriptions also phone, start and end date). Tap a field, send the new value, repeat, then tap Done. Profit, gross price and the paid/due amount are recalculated automatically.
 - `/deletesale <id>` / `/deletesub <id>` — remove an entry (find IDs in `/sales`, `/subs`, `/dues`)
 - `/menu` — everything above as tappable buttons
 
@@ -123,6 +124,7 @@ If you don't set it, it uses `TZ` if present, otherwise `Asia/Kolkata`. (Earlier
 | `REMINDER_HOUR` / `REMINDER_MINUTE` | `9` / `0` | When subscription reminders go out |
 | `REMINDER_DAYS_BEFORE` | `3` | How many days ahead of expiry to warn you |
 | `MORNING_SUMMARY_HOUR` / `_MINUTE` | `8` / `0` | When the daily summary is sent (`-1` turns it off) |
+| `TG_SYNC_HOUR` / `_MINUTE` | `3` / `0` | When customers' Telegram usernames are re-checked (`-1` turns it off) |
 | `MIN_MARGIN_PCT` | `10` | The review screen warns when profit ÷ amount charged is below this % |
 | `DEFAULT_COUNTRY_CODE` | `91` | Added to 10-digit phone numbers for WhatsApp links |
 | `WHATSAPP_MESSAGE` | *(a friendly default)* | Text pre-filled in the WhatsApp button. Placeholders: `{customer}` `{item}` `{end_date}` |
@@ -165,6 +167,21 @@ cp .env.example .env   # then edit BOT_TOKEN and DATABASE_URL
 # run permanently with systemd or:
 nohup python main.py &
 ```
+
+## Customers' Telegram (numeric ID → username kept up to date)
+
+A Telegram *username* can change; the numeric *ID* never does. So when logging a sale or subscription, give the customer's **numeric ID** and the bot looks up the username itself and keeps it current:
+
+1. The customer opens your bot, presses **Start**, and sends `/myid` — the bot replies with their ID. They send that number to you.
+2. In `/newsale` / `/newsub` (or `/editsale` / `/editsub` → Telegram), send the ID. The bot fetches the username right away (`✅ Found them: @alice`).
+3. **Every day** (at `TG_SYNC_HOUR`, default 3 AM) the bot re-checks every saved ID. If someone changed or removed their username, every entry of theirs is updated and you get a short message. Run `/syncusernames` to do the check immediately.
+4. Renewal reminders and `/expiring` get a **✈️ Message on Telegram** button using the current username.
+
+**Good to know**
+- Telegram only lets a bot look a person up **after they have pressed Start on your bot**. Until then the ID is saved, the username stays empty, and the daily check fills it in as soon as they've started the bot.
+- If someone has no public username, the ID is kept and the Telegram button is hidden until they set one.
+- Adding an ID to one entry also links the customer's other entries (matched by name) that have no ID yet.
+- You can still just type an `@username` instead of an ID — it works, but it can't be refreshed automatically.
 
 ## Google Sheets sync (optional)
 
