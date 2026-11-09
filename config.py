@@ -40,6 +40,11 @@ REMINDER_DAYS_BEFORE = int(os.getenv("REMINDER_DAYS_BEFORE", "3"))
 MORNING_SUMMARY_HOUR = int(os.getenv("MORNING_SUMMARY_HOUR", "8"))
 MORNING_SUMMARY_MINUTE = int(os.getenv("MORNING_SUMMARY_MINUTE", "0"))
 
+# Daily check that refreshes customers' Telegram usernames from their saved numeric IDs.
+# Runs before the reminders so they use fresh usernames. Set TG_SYNC_HOUR=-1 to turn it off.
+TG_SYNC_HOUR = int(os.getenv("TG_SYNC_HOUR", "3"))
+TG_SYNC_MINUTE = int(os.getenv("TG_SYNC_MINUTE", "0"))
+
 # ---------- business rules ----------
 # The confirm screen warns when a sale's margin (profit / amount charged) is below this %.
 MIN_MARGIN_PCT = float(os.getenv("MIN_MARGIN_PCT", "10"))
