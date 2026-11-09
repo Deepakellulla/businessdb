@@ -14,12 +14,12 @@ logger = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 SALES_HEADERS = [
-    "ID", "Date", "Item", "Customer", "Seller", "Supplier", "Gross Price", "Discount",
+    "ID", "Date", "Item", "Customer", "Telegram", "Seller", "Supplier", "Gross Price", "Discount",
     "Sold Price", "Cost Price", "Profit", "Amount Paid", "Balance Due",
     "Payment Method", "Logged By",
 ]
 SUBS_HEADERS = [
-    "ID", "Customer", "Phone", "Item", "Seller", "Supplier", "Gross Price", "Discount",
+    "ID", "Customer", "Phone", "Telegram", "Item", "Seller", "Supplier", "Gross Price", "Discount",
     "Sold Price", "Cost Price", "Profit", "Amount Paid", "Balance Due",
     "Start Date", "End Date", "Active", "Payment Method", "Logged By",
 ]
@@ -78,9 +78,16 @@ def _balance(s: dict) -> float:
     return round(max(s["sold_price"] - _paid(s), 0.0), 2)
 
 
+def _tg_cell(s: dict) -> str:
+    if s.get("tg_username"):
+        return f"@{s['tg_username']}"
+    return f"ID {s['tg_id']}" if s.get("tg_id") else ""
+
+
 def _sale_row(s: dict) -> list:
     return [
-        s["id"], s["sale_date"], s["item"], s["customer"] or "", s.get("seller") or "",
+        s["id"], s["sale_date"], s["item"], s["customer"] or "",
+        _tg_cell(s), s.get("seller") or "",
         s.get("supplier") or "", s["gross_price"], s["discount"], s["sold_price"], s["cost_price"],
         s["profit"], _paid(s), _balance(s), s["payment_method"] or "", s["logged_by"] or "",
     ]
@@ -88,7 +95,8 @@ def _sale_row(s: dict) -> list:
 
 def _sub_row(s: dict) -> list:
     return [
-        s["id"], s["customer"], (f"+{s['phone']}" if s.get("phone") else ""), s["item"],
+        s["id"], s["customer"], (f"+{s['phone']}" if s.get("phone") else ""),
+        _tg_cell(s), s["item"],
         s.get("seller") or "", s.get("supplier") or "", s["gross_price"], s["discount"],
         s["sold_price"], s["cost_price"], s["profit"], _paid(s), _balance(s),
         s["start_date"], s["end_date"], "Yes" if s["active"] else "No",
@@ -136,6 +144,15 @@ def _refresh_monthly_summary(all_sales, all_subs):
         ws.append_rows(rows)
 
 
+def _ensure_width(ws, needed: int):
+    """Older tabs were created with fewer columns; widen them before writing a longer header."""
+    try:
+        if ws.col_count < needed:
+            ws.add_cols(needed - ws.col_count)
+    except Exception:
+        logger.exception("Could not widen worksheet %s", getattr(ws, "title", "?"))
+
+
 def push_sale(sale_row: dict, all_sales=None, all_subs=None):
     """
     Best-effort: logs and swallows errors so a Sheets outage never breaks saving data.
@@ -175,6 +192,7 @@ def full_resync(all_sales, all_subs) -> tuple:
     with _lock:
         ws_sales = _get_or_create_worksheet("Sales", SALES_HEADERS)
         ws_sales.clear()
+        _ensure_width(ws_sales, len(SALES_HEADERS))
         ws_sales.append_row(SALES_HEADERS)
         rows = [_sale_row(s) for s in all_sales]
         if rows:
@@ -182,6 +200,7 @@ def full_resync(all_sales, all_subs) -> tuple:
 
         ws_subs = _get_or_create_worksheet("Subscriptions", SUBS_HEADERS)
         ws_subs.clear()
+        _ensure_width(ws_subs, len(SUBS_HEADERS))
         ws_subs.append_row(SUBS_HEADERS)
         rows2 = [_sub_row(s) for s in all_subs]
         if rows2:
