@@ -21,9 +21,10 @@ from telegram.ext import (
 )
 
 import db
+import tgsync
 from helpers import (
-    LIFETIME_DAYS, ack, esc, money, normalize_phone, parse_date_input, reply_to,
-    require_auth, resync_sheets_in_background,
+    LIFETIME_DAYS, ack, esc, money, normalize_phone, parse_date_input, parse_tg_contact,
+    reply_to, require_auth, resync_sheets_in_background,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ FIELDS = {
     "sale": [
         ("item", "Item", "text"),
         ("customer", "Customer", "text_opt"),
+        ("tg_username", "Telegram", "tgname"),
         ("sale_date", "Date", "date"),
         ("sold_price", "Sold price", "money"),
         ("cost_price", "Cost price", "money"),
@@ -51,6 +53,7 @@ FIELDS = {
         ("customer", "Customer", "text"),
         ("item", "Item", "text"),
         ("phone", "Phone", "phone"),
+        ("tg_username", "Telegram", "tgname"),
         ("start_date", "Start date", "date"),
         ("end_date", "End date", "enddate"),
         ("sold_price", "Sold price", "money"),
@@ -69,7 +72,7 @@ USAGE = (
     "• A sale: <code>/editsale &lt;id&gt;</code>  (IDs via /sales)\n"
     "• A subscription: <code>/editsub &lt;id&gt;</code>  (IDs via /subs)\n\n"
     "You can change any field: item, customer, dates, prices, discount, payment, seller, "
-    "supplier, phone…"
+    "supplier, phone, Telegram username…"
 )
 
 
@@ -93,6 +96,7 @@ def _summary(kind: str, row) -> str:
     lines = [f"✏️ <b>Editing {KIND_NAME[kind]} #{row['id']}</b>", ""]
     lines.append(f"<b>Item:</b> {_show(row['item'])}")
     lines.append(f"<b>Customer:</b> {_show(row['customer'])}")
+    lines.append(f"<b>Telegram:</b> {_tg_text(row)}")
     if kind == "sub":
         lines.append(f"<b>Phone:</b> {_show(row.get('phone'))}")
         lines.append(f"<b>Period:</b> {_show(row['start_date'])} → {_show(row['end_date'])}")
@@ -111,6 +115,17 @@ def _summary(kind: str, row) -> str:
     lines.append("")
     lines.append("Tap the field you want to change:")
     return "\n".join(lines)
+
+
+def _tg_text(row) -> str:
+    uname, tid = row.get("tg_username"), row.get("tg_id")
+    if uname and tid:
+        return f"@{esc(uname)} (ID {tid})"
+    if uname:
+        return f"@{esc(uname)}"
+    if tid:
+        return f"ID {tid} (username not found yet)"
+    return "—"
 
 
 def _keyboard(kind: str) -> InlineKeyboardMarkup:
@@ -204,6 +219,11 @@ def _prompt_for(kind: str, column: str, row) -> tuple:
         text += ("Send the phone number (with country code, or just 10 digits), "
                  "or tap Clear to remove it:")
         rows.append([InlineKeyboardButton("🗑 Clear", callback_data="ed:clear")])
+    elif vtype == "tgname":
+        text += ("Send their <b>numeric Telegram ID</b> (best: I fetch the username and keep it updated; "
+                 "they get it by sending /myid to this bot), or just their @username.\n"
+                 "Tap Clear to remove it:")
+        rows.append([InlineKeyboardButton("🗑 Clear", callback_data="ed:clear")])
     elif vtype == "money":
         text += "Send the new amount (a number):"
     elif vtype == "paid":
@@ -273,8 +293,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, vtype = _field_info(kind, column)
 
     if data == "ed:clear":
-        if vtype not in ("text_opt", "phone"):
+        if vtype not in ("text_opt", "phone", "tgname"):
             return VALUE
+        if vtype == "tgname":
+            return await _apply(update, context, {"tg_username": None, "tg_id": None})
         return await _apply(update, context, {column: None})
 
     if data.startswith("ed:v:"):
@@ -329,6 +351,16 @@ def _parse_value(kind: str, column: str, vtype: str, text: str, row) -> object:
             raise ValueError(
                 "That doesn't look like a phone number. Send it with country code "
                 "(e.g. 919876543210) or just the 10 digits, or tap Clear to remove it."
+            )
+    if vtype == "tgname":
+        if text.strip() in ("-", "—"):
+            return {"tg_id": None, "tg_username": None}
+        try:
+            return parse_tg_contact(text)
+        except ValueError:
+            raise ValueError(
+                "I couldn't read that. Send their numeric Telegram ID (digits only) or their @username, "
+                "or tap Clear to remove it."
             )
     if vtype == "payment":
         return _parse_text(text, "payment method", maxlen=40)
@@ -391,10 +423,39 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError as e:
         await reply_to(update, f"⚠️ {esc(e)}")
         return VALUE
+    if vtype == "tgname":
+        return await _apply_tg(update, context, row, value)
     return await _apply(update, context, {column: value})
 
 
-async def _apply(update: Update, context: ContextTypes.DEFAULT_TYPE, changes: dict):
+async def _apply_tg(update: Update, context: ContextTypes.DEFAULT_TYPE, row, contact: dict):
+    """Telegram ID -> look the username up now; username only -> store it (and stop tracking an old ID)."""
+    notes = ""
+    if contact["tg_id"]:
+        status, username = await tgsync.lookup(context.bot, contact["tg_id"])
+        if status == tgsync.OK:
+            final_username = username
+            notes = (f"Found <b>@{esc(username)}</b> — it will stay up to date automatically."
+                     if username else "Found them, but they have no public username yet — I'll pick it up if they add one.")
+        else:
+            final_username = row.get("tg_username")  # keep what we had until we can look it up
+            bot_name = context.bot.username
+            notes = ("I can't see this person on Telegram yet, so their username isn't filled in. "
+                     + (f"Ask them to open https://t.me/{bot_name} and press Start" if bot_name
+                        else "Ask them to open this bot and press Start")
+                     + "; the daily check will then fill it in.")
+        changes = {"tg_id": contact["tg_id"], "tg_username": final_username}
+        linked = db.link_customer_tg(row.get("customer"), contact["tg_id"], final_username)
+        if linked:
+            notes += f"\nAlso linked this ID to {linked} older entr{'y' if linked == 1 else 'ies'} of this customer."
+    else:
+        changes = {"tg_id": None, "tg_username": contact["tg_username"]}
+        if row.get("tg_id") and contact["tg_username"]:
+            notes = "Automatic username updates are off for this entry — send the numeric ID instead to keep it updated."
+    return await _apply(update, context, changes, notes=notes)
+
+
+async def _apply(update: Update, context: ContextTypes.DEFAULT_TYPE, changes: dict, notes: str = ""):
     st = _state(context)
     kind = st["kind"]
     new_row = db.update_entry(kind, st["id"], changes)
@@ -403,9 +464,9 @@ async def _apply(update: Update, context: ContextTypes.DEFAULT_TYPE, changes: di
         await reply_to(update, f"That {KIND_NAME[kind]} no longer exists.")
         return ConversationHandler.END
     resync_sheets_in_background()
-    column = next(iter(changes))
+    column = "tg_username" if ("tg_id" in changes or "tg_username" in changes) else next(iter(changes))
     label, _ = _field_info(kind, column)
-    return await _show_menu(update, context, prefix=f"✅ {label} updated.\n\n")
+    return await _show_menu(update, context, prefix=f"✅ {label} updated." + (f"\n{notes}" if notes else "") + "\n\n")
 
 
 # ------------------------------------------------------------------ cancel / timeout / stale
