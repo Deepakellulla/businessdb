@@ -100,6 +100,7 @@ def init_db():
             ("gross_price", "DOUBLE PRECISION"), ("payment_method", "TEXT"),
             ("seller", "TEXT"), ("supplier", "TEXT"),
             ("amount_paid", "DOUBLE PRECISION"), ("created_at", "TIMESTAMPTZ"),
+            ("tg_username", "TEXT"), ("tg_id", "BIGINT"),
         ]
         sub_only_cols = [("phone", "TEXT"), ("renewed_to", "INTEGER")]
         for table, new_cols in (
@@ -158,7 +159,7 @@ def _iso(d):
 
 def add_sale(item, customer, sold_price, cost_price, logged_by=None,
              discount=0.0, gross_price=None, payment_method=None,
-             sale_date=None, seller=None, supplier=None, amount_paid=None):
+             sale_date=None, seller=None, supplier=None, amount_paid=None, tg_username=None, tg_id=None):
     """
     sold_price = final/net amount actually received (after discount).
     gross_price = list price before discount; if not given, computed as sold_price + discount.
@@ -173,10 +174,10 @@ def add_sale(item, customer, sold_price, cost_price, logged_by=None,
         cur = conn.execute(
             "INSERT INTO sales "
             "(item, customer, sold_price, cost_price, profit, sale_date, logged_by, "
-            " discount, gross_price, payment_method, seller, supplier, amount_paid) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            " discount, gross_price, payment_method, seller, supplier, amount_paid, tg_username, tg_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (item, customer, sold_price, cost_price, profit, _iso(sale_date), logged_by,
-             discount, gross_price, payment_method, seller, supplier, amount_paid),
+             discount, gross_price, payment_method, seller, supplier, amount_paid, tg_username, tg_id),
         )
         new_id = cur.fetchone()["id"]
         conn.commit()
@@ -305,7 +306,8 @@ def discount_summary(since_date: str = None):
 
 def add_subscription(customer, item, sold_price, cost_price, start_date: date, duration_days: int,
                       logged_by=None, discount=0.0, gross_price=None, payment_method=None,
-                      seller=None, supplier=None, amount_paid=None, phone=None):
+                      seller=None, supplier=None, amount_paid=None, phone=None, tg_username=None,
+                      tg_id=None):
     end_date = start_date.fromordinal(start_date.toordinal() + duration_days)
     if gross_price is None:
         gross_price = sold_price + discount
@@ -316,11 +318,13 @@ def add_subscription(customer, item, sold_price, cost_price, start_date: date, d
         cur = conn.execute(
             "INSERT INTO subscriptions "
             "(customer, item, sold_price, cost_price, profit, start_date, end_date, logged_by, "
-            " discount, gross_price, payment_method, seller, supplier, amount_paid, phone) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            " discount, gross_price, payment_method, seller, supplier, amount_paid, phone, tg_username, "
+            " tg_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (customer, item, sold_price, cost_price, profit,
              start_date.isoformat(), end_date.isoformat(), logged_by,
-             discount, gross_price, payment_method, seller, supplier, amount_paid, phone),
+             discount, gross_price, payment_method, seller, supplier, amount_paid, phone, tg_username,
+             tg_id),
         )
         new_id = cur.fetchone()["id"]
         conn.commit()
@@ -351,11 +355,11 @@ def update_subscription(sub_id, sold_price, cost_price):
 _EDITABLE = {
     "sale": ("sales", {
         "item", "customer", "sale_date", "sold_price", "cost_price", "discount",
-        "payment_method", "amount_paid", "seller", "supplier",
+        "payment_method", "amount_paid", "seller", "supplier", "tg_username", "tg_id",
     }),
     "sub": ("subscriptions", {
         "item", "customer", "phone", "start_date", "end_date", "sold_price", "cost_price",
-        "discount", "payment_method", "amount_paid", "seller", "supplier",
+        "discount", "payment_method", "amount_paid", "seller", "supplier", "tg_username", "tg_id",
     }),
 }
 
@@ -869,6 +873,79 @@ def customer_phone(name: str):
         return row["phone"] if row else None
 
 
+def customer_tg(name):
+    """
+    Most recent Telegram contact saved for this customer (case-insensitive):
+    {"tg_id": int|None, "tg_username": str|None}, or None if there isn't one.
+    """
+    if not name:
+        return None
+    with get_conn() as conn:
+        for table in ("subscriptions", "sales"):
+            row = conn.execute(
+                f"SELECT tg_id, tg_username FROM {table} WHERE LOWER(customer) = LOWER(%s) "
+                "AND (tg_id IS NOT NULL OR COALESCE(tg_username, '') <> '') ORDER BY id DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+            if row:
+                return {"tg_id": row["tg_id"], "tg_username": row["tg_username"] or None}
+    return None
+
+
+def link_customer_tg(name, tg_id, username) -> int:
+    """
+    Attach a Telegram ID (and its username, when known) to this customer's older entries that
+    don't have an ID yet, so the daily username check keeps *all* of them up to date.
+    Entries that already have an ID are left alone. Returns rows updated.
+    """
+    if not name or not tg_id:
+        return 0
+    total = 0
+    with get_conn() as conn:
+        for table in ("subscriptions", "sales"):
+            cur = conn.execute(
+                f"UPDATE {table} SET tg_id=%s, tg_username=COALESCE(%s, tg_username) "
+                "WHERE LOWER(customer) = LOWER(%s) AND tg_id IS NULL",
+                (tg_id, username, name),
+            )
+            total += cur.rowcount
+        conn.commit()
+    return total
+
+
+def tg_ids_to_check() -> list:
+    """Every distinct Telegram ID saved on any sale or subscription."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT tg_id FROM subscriptions WHERE tg_id IS NOT NULL "
+            "UNION SELECT tg_id FROM sales WHERE tg_id IS NOT NULL ORDER BY 1"
+        ).fetchall()
+    return [r["tg_id"] for r in rows]
+
+
+def set_tg_username_for_id(tg_id: int, new_username):
+    """
+    Point every entry with this Telegram ID at the current username (None = they removed it).
+    Returns [(customer, old_username), ...] for the entries that actually changed.
+    """
+    changed = []
+    with get_conn() as conn:
+        for table in ("subscriptions", "sales"):
+            rows = conn.execute(
+                f"SELECT customer, tg_username FROM {table} "
+                "WHERE tg_id=%s AND tg_username IS DISTINCT FROM %s",
+                (tg_id, new_username),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    f"UPDATE {table} SET tg_username=%s WHERE tg_id=%s AND tg_username IS DISTINCT FROM %s",
+                    (new_username, tg_id, new_username),
+                )
+                changed += [(r["customer"], r["tg_username"]) for r in rows]
+        conn.commit()
+    return changed
+
+
 def set_customer_phone(name: str, phone: str) -> int:
     """Sets the phone on every subscription of this customer. Returns rows updated."""
     with get_conn() as conn:
@@ -963,7 +1040,8 @@ def renew_subscription(sub_id: int, paid: bool = True, logged_by=None, today: da
         old["customer"], old["item"], sold, old["cost_price"], today, duration,
         logged_by=logged_by, discount=old["discount"] or 0.0, gross_price=old["gross_price"],
         payment_method=old["payment_method"], seller=old["seller"], supplier=old["supplier"],
-        amount_paid=sold if paid else 0.0, phone=old["phone"],
+        amount_paid=sold if paid else 0.0, phone=old["phone"], tg_username=old.get("tg_username"),
+        tg_id=old.get("tg_id"),
     )
     with get_conn() as conn:
         cur = conn.execute(
