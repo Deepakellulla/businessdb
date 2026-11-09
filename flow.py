@@ -25,6 +25,7 @@ from telegram.ext import (
 )
 
 import db
+import tgsync
 from config import MIN_MARGIN_PCT, REMINDER_DAYS_BEFORE
 from helpers import (
     LIFETIME_DAYS,
@@ -35,6 +36,7 @@ from helpers import (
     money,
     normalize_phone,
     parse_date_input,
+    parse_tg_contact,
     push_new_to_sheets,
     reply_to,
     require_auth,
@@ -62,6 +64,7 @@ class Step:
     when: Optional[Callable[[dict], bool]] = None         # step only runs when this is true
     numbered: bool = True                                 # counts toward "Step n/total"
     store: Optional[Callable[[dict, object], None]] = None
+    after: Optional[Callable] = None                      # async (update, context, d) run right after the answer is stored
 
 
 @dataclass
@@ -177,6 +180,80 @@ def s_phone() -> Step:
         parse=lambda t, d: normalize_phone(t),
         buttons=buttons,
         pick=pick,
+    )
+
+
+def _tg_label(d: dict) -> str:
+    """'@alice', 'ID 123456789' or 'ID 123456789 (username not found yet)' for review screens."""
+    uname, tid = d.get("tg_username"), d.get("tg_id")
+    if uname and tid:
+        return f"@{esc(uname)} (ID {tid})"
+    if uname:
+        return f"@{esc(uname)}"
+    if tid:
+        return f"ID {tid} (username not found yet)"
+    return ""
+
+
+def s_tg(only_with_customer: bool = False) -> Step:
+    """Customer's Telegram: a numeric ID (preferred) or a @username. Always optional."""
+
+    def buttons(d):
+        saved = db.customer_tg(d.get("customer"))
+        d["_saved_tg"] = saved
+        rows = []
+        if saved:
+            label = f"@{saved['tg_username']}" if saved["tg_username"] else f"ID {saved['tg_id']}"
+            rows.append([(f"✅ Use saved {label}"[:60], "saved")])
+        rows.append([("⏭ Skip", "skip")])
+        return rows
+
+    def pick(token, d):
+        return d.get("_saved_tg") if token == "saved" else None
+
+    def parse(text, d):
+        if text.strip() == "-":
+            return None
+        return parse_tg_contact(text)
+
+    def store(d, value):
+        d["tg_id"] = value["tg_id"] if value else None
+        d["tg_username"] = value["tg_username"] if value else None
+
+    async def after(update, context, d):
+        """Right after the answer: if we have an ID, fetch the username now and say how it went."""
+        if not d.get("tg_id"):
+            return
+        status, username = await tgsync.lookup(context.bot, d["tg_id"])
+        if status == tgsync.OK:
+            d["tg_username"] = username
+            if username:
+                await reply_to(update, f"✅ Found them: <b>@{esc(username)}</b> — I'll keep it updated if they change it.")
+            else:
+                await reply_to(update, "ℹ️ Found them, but they don't have a public username set. "
+                                       "I've saved their ID and will pick the username up if they add one.")
+        elif status == tgsync.UNREACHABLE:
+            bot_name = context.bot.username
+            link = f"\nAsk them to open https://t.me/{bot_name} and press <b>Start</b> once." if bot_name else \
+                "\nAsk them to open this bot and press <b>Start</b> once."
+            await reply_to(update, f"ℹ️ Saved ID <code>{d['tg_id']}</code>, but I can't see this person on Telegram yet.{link}\n"
+                                   "Their username is filled in automatically by the daily check after that.")
+        else:
+            await reply_to(update, "⚠️ Couldn't reach Telegram just now. The ID is saved and I'll look the "
+                                   "username up again in the daily check.")
+
+    return Step(
+        "tg",
+        lambda d: "✈️ Customer's Telegram — optional.\n"
+                  "Best: send their <b>numeric ID</b> (they get it by sending /myid to this bot). I'll fetch their "
+                  "username and keep it updated if they change it.\n"
+                  "Or just send their @username. Tap Skip to leave it out.",
+        parse=parse,
+        buttons=buttons,
+        pick=pick,
+        when=(lambda d: bool(d.get("customer"))) if only_with_customer else None,
+        store=store,
+        after=after,
     )
 
 
@@ -434,6 +511,8 @@ def _sale_summary(d: dict) -> str:
     lines = ["🔎 <b>Review Sale</b>", ""]
     lines.append(f"🏷 Item: <b>{esc(d['item'])}</b>")
     lines.append(f"👤 Customer: {esc(d['customer']) if d['customer'] else '—'}")
+    if _tg_label(d):
+        lines.append(f"✈️ Telegram: {_tg_label(d)}")
     if d.get("seller"):
         lines.append(f"🧑‍💼 Seller: {esc(d['seller'])}")
     lines.append(f"📅 Sold on: {d['date'].isoformat()}")
@@ -447,6 +526,8 @@ def _sub_summary(d: dict) -> str:
     lines.append(f"👤 Customer: <b>{esc(d['customer'])}</b>")
     if d.get("phone"):
         lines.append(f"📞 Phone: +{d['phone']}")
+    if _tg_label(d):
+        lines.append(f"✈️ Telegram: {_tg_label(d)}")
     lines.append(f"🏷 Item: <b>{esc(d['item'])}</b>")
     if d.get("seller"):
         lines.append(f"🧑‍💼 Seller: {esc(d['seller'])}")
@@ -464,10 +545,13 @@ def _save_sale(update: Update, d: dict) -> str:
         d["item"], d["customer"], sold, d["cost_price"], logged_by=display_name(update),
         discount=d["discount"], gross_price=d["gross_price"], payment_method=d["payment_method"],
         sale_date=d["date"], seller=d.get("seller"), supplier=d.get("supplier"),
-        amount_paid=d["amount_paid"],
+        amount_paid=d["amount_paid"], tg_username=d.get("tg_username"), tg_id=d.get("tg_id"),
     )
+    linked = db.link_customer_tg(d.get("customer"), d.get("tg_id"), d.get("tg_username"))
     push_new_to_sheets("sale", sale_id)
     msg = f"✅ <b>Sale #{sale_id} saved!</b>\nProfit: <b>{money(profit)}</b>"
+    if linked:
+        msg += f"\n🔗 Also linked their Telegram ID to {linked} older entr{'y' if linked == 1 else 'ies'}."
     due = sold - d["amount_paid"]
     if due > 0.005:
         msg += f"\n\n🔴 {money(due)} still due — record it later with <code>/receive sale {sale_id}</code>."
@@ -480,8 +564,10 @@ def _save_sub(update: Update, d: dict) -> str:
         d["customer"], d["item"], sold, d["cost_price"], d["date"], d["duration"],
         logged_by=display_name(update), discount=d["discount"], gross_price=d["gross_price"],
         payment_method=d["payment_method"], seller=d.get("seller"), supplier=d.get("supplier"),
-        amount_paid=d["amount_paid"], phone=d.get("phone"),
+        amount_paid=d["amount_paid"], phone=d.get("phone"), tg_username=d.get("tg_username"),
+        tg_id=d.get("tg_id"),
     )
+    linked = db.link_customer_tg(d.get("customer"), d.get("tg_id"), d.get("tg_username"))
     push_new_to_sheets("sub", sub_id)
 
     if is_lifetime_duration(d["duration"]):
@@ -497,7 +583,10 @@ def _save_sub(update: Update, d: dict) -> str:
             )
         else:
             msg += f"I'll remind you {REMINDER_DAYS_BEFORE} days before it ends, and on the day"
-            msg += " — with 🔁 Renew" + (" and 💬 WhatsApp buttons." if d.get("phone") else " buttons.")
+            extras = (["💬 WhatsApp"] if d.get("phone") else []) + (["✈️ Telegram"] if d.get("tg_username") else [])
+            msg += " — with 🔁 Renew" + (" and " + " + ".join(extras) + " buttons." if extras else " buttons.")
+    if linked:
+        msg += f"\n🔗 Also linked their Telegram ID to {linked} older entr{'y' if linked == 1 else 'ies'}."
     due = sold - d["amount_paid"]
     if due > 0.005:
         msg += f"\n\n🔴 {money(due)} still due — record it later with <code>/receive sub {sub_id}</code>."
@@ -541,13 +630,15 @@ def _pkind_step() -> Step:
 FLOWS = {
     "sale": Flow(
         "sale", "New Sale", "🧾",
-        [s_item("sale"), s_customer(False), s_seller(), s_date(), s_gross("sale"), s_discount(),
+        [s_item("sale"), s_customer(False), s_tg(only_with_customer=True), s_seller(), s_date(),
+         s_gross("sale"), s_discount(),
          s_cost("sale"), s_supplier(), s_payment(), s_pstatus(), s_partial()],
         _sale_summary, _save_sale,
     ),
     "sub": Flow(
         "sub", "New Subscription", "📋",
-        [s_customer(True), s_phone(), s_item("sub"), s_seller(), s_date(), s_gross("sub"), s_discount(),
+        [s_customer(True), s_phone(), s_tg(), s_item("sub"), s_seller(), s_date(), s_gross("sub"),
+         s_discount(),
          s_cost("sub"), s_supplier(), s_payment(), s_pstatus(), s_partial(), s_duration()],
         _sub_summary, _save_sub,
     ),
@@ -649,6 +740,8 @@ async def _advance(update, context, flow: Flow, step: Step, value) -> int:
         step.store(d, value)
     else:
         d[step.key] = value
+    if step.after:
+        await step.after(update, context, d)
     nxt = _next_step(flow, d, step.key)
     if nxt:
         d["_step"] = nxt.key
