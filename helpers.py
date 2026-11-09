@@ -111,6 +111,51 @@ def normalize_phone(text: str) -> str:
     return digits
 
 
+_TG_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+
+
+def normalize_tg_username(text: str) -> str:
+    """
+    '@alice', 'alice', 't.me/alice' or 'https://t.me/alice' -> 'alice' (stored without the @).
+    Raises ValueError if it can't be a real Telegram username (5-32 letters/digits/underscores,
+    starting with a letter).
+    """
+    t = (text or "").strip()
+    t = re.sub(r"^(https?://)?(www\.)?(t|telegram)\.me/", "", t, flags=re.IGNORECASE)
+    t = t.split("?")[0].split("/")[0].lstrip("@").strip()
+    if not _TG_USERNAME_RE.match(t):
+        raise ValueError(
+            "That doesn't look like a Telegram username. Send it like @alice "
+            "(5-32 letters, numbers or underscores, starting with a letter), or tap Skip."
+        )
+    return t
+
+
+def parse_tg_contact(text: str) -> dict:
+    """
+    Customer's Telegram contact typed by the user. Either:
+      * a numeric user ID (digits only, e.g. 123456789)   -> {"tg_id": 123456789, "tg_username": None}
+      * a username (@alice, alice, t.me/alice)             -> {"tg_id": None, "tg_username": "alice"}
+    The ID is the better thing to give: the bot can then look the username up itself and keep it
+    up to date if the customer changes it.
+    """
+    t = (text or "").strip()
+    if re.fullmatch(r"\d{5,15}", t):
+        return {"tg_id": int(t), "tg_username": None}
+    try:
+        return {"tg_id": None, "tg_username": normalize_tg_username(t)}
+    except ValueError:
+        raise ValueError(
+            "I couldn't read that. Send their numeric Telegram ID (digits only — they can get it by "
+            "sending /myid to this bot) or their @username, or tap Skip."
+        )
+
+
+def telegram_link(username: str) -> str:
+    """t.me link that opens a chat with this username."""
+    return f"https://t.me/{username}"
+
+
 class _SafeDict(dict):
     def __missing__(self, key):
         return "{" + key + "}"
