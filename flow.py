@@ -34,7 +34,9 @@ from helpers import (
     esc,
     is_lifetime_duration,
     money,
+    normalize_ig_username,
     normalize_phone,
+    normalize_platform,
     parse_date_input,
     parse_tg_contact,
     push_new_to_sheets,
@@ -175,11 +177,75 @@ def s_phone() -> Step:
 
     return Step(
         "phone",
-        lambda d: "📞 Customer's WhatsApp/phone number? Include the country code (e.g. 919876543210) "
+        lambda d: "📱 Customer's WhatsApp number? Include the country code (e.g. 919876543210) "
                   "or just the 10 digits.\nRenewal reminders get a one-tap WhatsApp button when this is set.",
         parse=lambda t, d: normalize_phone(t),
         buttons=buttons,
         pick=pick,
+    )
+
+
+def _on(platform: str):
+    """Condition for a contact step: only ask when the customer bought via this platform."""
+    return lambda d: d.get("platform") == platform
+
+
+def s_platform() -> Step:
+    """Where did the customer buy from? WhatsApp / Telegram / Instagram / anything else (typed)."""
+    names = {"wa": "WhatsApp", "tg": "Telegram", "ig": "Instagram"}
+
+    def buttons(d):
+        last = db.customer_platform(d.get("customer"))
+        d["_last_platform"] = last
+        rows = []
+        if last:
+            rows.append([(f"✅ Same as before: {last}"[:60], "last")])
+        rows.append([("📱 WhatsApp", "wa"), ("✈️ Telegram", "tg"), ("📸 Instagram", "ig")])
+        rows.append([("🌐 Other (type it)", "other"), ("⏭ Skip", "skip")])
+        return rows
+
+    def pick(token, d):
+        if token == "other":
+            return Stay("✏️ Type the platform name (e.g. Facebook, Website, Walk-in):")
+        if token == "skip":
+            return None
+        if token == "last":
+            return d["_last_platform"]
+        return names[token]
+
+    return Step(
+        "platform",
+        lambda d: "🛒 Which platform did they buy from?\n"
+                  "I'll then ask for their contact there — WhatsApp → phone number, Telegram → ID or "
+                  "username, Instagram → username.",
+        parse=lambda t, d: normalize_platform(t),
+        buttons=buttons,
+        pick=pick,
+    )
+
+
+def s_ig() -> Step:
+    def buttons(d):
+        saved = db.customer_ig(d.get("customer"))
+        d["_saved_ig"] = saved
+        rows = []
+        if saved:
+            rows.append([(f"✅ Use saved @{saved}"[:60], "saved")])
+        rows.append([("⏭ Skip", "skip")])
+        return rows
+
+    def parse(text, d):
+        if text.strip() == "-":
+            return None
+        return normalize_ig_username(text)
+
+    return Step(
+        "ig_username",
+        lambda d: "📸 Customer's Instagram username? (e.g. @alice.shop) — or tap Skip.\n"
+                  "Renewal reminders get a button that opens their Instagram profile.",
+        parse=parse,
+        buttons=buttons,
+        pick=lambda token, d: d.get("_saved_ig") if token == "saved" else None,
     )
 
 
@@ -195,7 +261,7 @@ def _tg_label(d: dict) -> str:
     return ""
 
 
-def s_tg(only_with_customer: bool = False) -> Step:
+def s_tg() -> Step:
     """Customer's Telegram: a numeric ID (preferred) or a @username. Always optional."""
 
     def buttons(d):
@@ -251,7 +317,6 @@ def s_tg(only_with_customer: bool = False) -> Step:
         parse=parse,
         buttons=buttons,
         pick=pick,
-        when=(lambda d: bool(d.get("customer"))) if only_with_customer else None,
         store=store,
         after=after,
     )
@@ -507,12 +572,25 @@ def _money_lines(d: dict) -> list:
     return lines
 
 
+def _contact_lines(d: dict) -> list:
+    """Platform + whichever contact was collected, for the review screens."""
+    lines = []
+    if d.get("platform"):
+        lines.append(f"🛒 Bought via: <b>{esc(d['platform'])}</b>")
+    if d.get("phone"):
+        lines.append(f"📱 WhatsApp: +{d['phone']}")
+    if _tg_label(d):
+        lines.append(f"✈️ Telegram: {_tg_label(d)}")
+    if d.get("ig_username"):
+        lines.append(f"📸 Instagram: @{esc(d['ig_username'])}")
+    return lines
+
+
 def _sale_summary(d: dict) -> str:
     lines = ["🔎 <b>Review Sale</b>", ""]
     lines.append(f"🏷 Item: <b>{esc(d['item'])}</b>")
     lines.append(f"👤 Customer: {esc(d['customer']) if d['customer'] else '—'}")
-    if _tg_label(d):
-        lines.append(f"✈️ Telegram: {_tg_label(d)}")
+    lines += _contact_lines(d)
     if d.get("seller"):
         lines.append(f"🧑‍💼 Seller: {esc(d['seller'])}")
     lines.append(f"📅 Sold on: {d['date'].isoformat()}")
@@ -524,10 +602,7 @@ def _sub_summary(d: dict) -> str:
     end = start.fromordinal(start.toordinal() + d["duration"])
     lines = ["🔎 <b>Review Subscription</b>", ""]
     lines.append(f"👤 Customer: <b>{esc(d['customer'])}</b>")
-    if d.get("phone"):
-        lines.append(f"📞 Phone: +{d['phone']}")
-    if _tg_label(d):
-        lines.append(f"✈️ Telegram: {_tg_label(d)}")
+    lines += _contact_lines(d)
     lines.append(f"🏷 Item: <b>{esc(d['item'])}</b>")
     if d.get("seller"):
         lines.append(f"🧑‍💼 Seller: {esc(d['seller'])}")
@@ -546,6 +621,7 @@ def _save_sale(update: Update, d: dict) -> str:
         discount=d["discount"], gross_price=d["gross_price"], payment_method=d["payment_method"],
         sale_date=d["date"], seller=d.get("seller"), supplier=d.get("supplier"),
         amount_paid=d["amount_paid"], tg_username=d.get("tg_username"), tg_id=d.get("tg_id"),
+        platform=d.get("platform"), ig_username=d.get("ig_username"), phone=d.get("phone"),
     )
     linked = db.link_customer_tg(d.get("customer"), d.get("tg_id"), d.get("tg_username"))
     push_new_to_sheets("sale", sale_id)
@@ -565,7 +641,7 @@ def _save_sub(update: Update, d: dict) -> str:
         logged_by=display_name(update), discount=d["discount"], gross_price=d["gross_price"],
         payment_method=d["payment_method"], seller=d.get("seller"), supplier=d.get("supplier"),
         amount_paid=d["amount_paid"], phone=d.get("phone"), tg_username=d.get("tg_username"),
-        tg_id=d.get("tg_id"),
+        tg_id=d.get("tg_id"), platform=d.get("platform"), ig_username=d.get("ig_username"),
     )
     linked = db.link_customer_tg(d.get("customer"), d.get("tg_id"), d.get("tg_username"))
     push_new_to_sheets("sub", sub_id)
@@ -583,7 +659,8 @@ def _save_sub(update: Update, d: dict) -> str:
             )
         else:
             msg += f"I'll remind you {REMINDER_DAYS_BEFORE} days before it ends, and on the day"
-            extras = (["💬 WhatsApp"] if d.get("phone") else []) + (["✈️ Telegram"] if d.get("tg_username") else [])
+            extras = (["💬 WhatsApp"] if d.get("phone") else []) + (["✈️ Telegram"] if d.get("tg_username") else []) \
+                + (["📸 Instagram"] if d.get("ig_username") else [])
             msg += " — with 🔁 Renew" + (" and " + " + ".join(extras) + " buttons." if extras else " buttons.")
     if linked:
         msg += f"\n🔗 Also linked their Telegram ID to {linked} older entr{'y' if linked == 1 else 'ies'}."
@@ -630,14 +707,18 @@ def _pkind_step() -> Step:
 FLOWS = {
     "sale": Flow(
         "sale", "New Sale", "🧾",
-        [s_item("sale"), s_customer(False), s_tg(only_with_customer=True), s_seller(), s_date(),
+        [s_item("sale"), s_customer(False), s_platform(),
+         replace(s_phone(), when=_on("WhatsApp")), replace(s_tg(), when=_on("Telegram")),
+         replace(s_ig(), when=_on("Instagram")), s_seller(), s_date(),
          s_gross("sale"), s_discount(),
          s_cost("sale"), s_supplier(), s_payment(), s_pstatus(), s_partial()],
         _sale_summary, _save_sale,
     ),
     "sub": Flow(
         "sub", "New Subscription", "📋",
-        [s_customer(True), s_phone(), s_tg(), s_item("sub"), s_seller(), s_date(), s_gross("sub"),
+        [s_customer(True), s_platform(),
+         replace(s_phone(), when=_on("WhatsApp")), replace(s_tg(), when=_on("Telegram")),
+         replace(s_ig(), when=_on("Instagram")), s_item("sub"), s_seller(), s_date(), s_gross("sub"),
          s_discount(),
          s_cost("sub"), s_supplier(), s_payment(), s_pstatus(), s_partial(), s_duration()],
         _sub_summary, _save_sub,
