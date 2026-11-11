@@ -12,8 +12,8 @@ automatically reminds you before — and when — a subscription ends.
 ## What it does
 
 **Log**
-- `/newsale` — log a one-time sale. Asks: item (or tap a saved product), customer, the customer's **Telegram** (optional — a numeric ID or @username; skipped when there's no customer), **seller**, date (tap Today or type a past date to backfill), price, discount, cost, **supplier**, payment method, **paid / part-paid / unpaid** — then a review screen with ✅ Confirm / 🔁 Start Over / ❌ Cancel. Nothing is saved until you confirm. The review screen warns about loss-making or low-margin sales.
-- `/newsub` — same, for subscriptions, plus the customer's **phone number** and **Telegram** (both optional — tap Skip) and a duration (30 / 90 / 365 days, any number, or **🔓 Lifetime**). Lifetime subscriptions never trigger renewal reminders.
+- `/newsale` — log a one-time sale. Asks: item (or tap a saved product), customer, **which platform they bought from** (📱 WhatsApp / ✈️ Telegram / 📸 Instagram / other, optional) and their contact there, **seller**, date (tap Today or type a past date to backfill), price, discount, cost, **supplier**, payment method, **paid / part-paid / unpaid** — then a review screen with ✅ Confirm / 🔁 Start Over / ❌ Cancel. Nothing is saved until you confirm. The review screen warns about loss-making or low-margin sales.
+- `/newsub` — same, for subscriptions, plus the platform they bought from (and their contact there) and a duration (30 / 90 / 365 days, any number, or **🔓 Lifetime**). Lifetime subscriptions never trigger renewal reminders.
 - `/undo` — took the wrong entry? Deletes the last sale/subscription *you* logged, within the last 24 hours (asks first). Undoing a renewal re-opens the original subscription.
 
 **Money owed**
@@ -167,6 +167,21 @@ cp .env.example .env   # then edit BOT_TOKEN and DATABASE_URL
 # run permanently with systemd or:
 nohup python main.py &
 ```
+
+## Where the customer bought from (platform + contact)
+
+`/newsale` and `/newsub` ask **which platform** the customer bought from, then ask for the matching contact:
+
+| Platform | What the bot asks for | What you get |
+|---|---|---|
+| 📱 **WhatsApp** | their phone number | one-tap WhatsApp button (pre-filled renewal message) on reminders |
+| ✈️ **Telegram** | numeric ID (best) or @username | button that opens their Telegram chat; username kept up to date (see below) |
+| 📸 **Instagram** | their Instagram username | button that opens their Instagram profile |
+| 🌐 **Other** | just a name you type (Facebook, Website, Walk-in…) | recorded for your reports, no contact step |
+
+Everything is optional — tap **Skip** at any step. If the customer has bought before, you get a **✅ Same as before** button and a **✅ Use saved…** button, so repeat customers take two taps.
+
+The platform and contact show on the review screen, in `/dues`, `/expiring`, `/customer`, the CSV exports and the Google Sheet. Reminders show the button for the platform they bought from **first**, then any other contact you have for them. Fix or add anything later with `/editsale` / `/editsub` — choosing a platform there jumps straight to the matching contact field. Entries logged before this feature simply have no platform until you set one.
 
 ## Customers' Telegram (numeric ID → username kept up to date)
 
