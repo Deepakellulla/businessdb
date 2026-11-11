@@ -23,8 +23,8 @@ from telegram.ext import (
 import db
 import tgsync
 from helpers import (
-    LIFETIME_DAYS, ack, esc, money, normalize_phone, parse_date_input, parse_tg_contact,
-    reply_to, require_auth, resync_sheets_in_background,
+    LIFETIME_DAYS, ack, esc, money, normalize_ig_username, normalize_phone, normalize_platform,
+    parse_date_input, parse_tg_contact, reply_to, require_auth, resync_sheets_in_background,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,10 @@ FIELDS = {
     "sale": [
         ("item", "Item", "text"),
         ("customer", "Customer", "text_opt"),
+        ("platform", "Platform", "platform"),
+        ("phone", "WhatsApp", "phone"),
         ("tg_username", "Telegram", "tgname"),
+        ("ig_username", "Instagram", "igname"),
         ("sale_date", "Date", "date"),
         ("sold_price", "Sold price", "money"),
         ("cost_price", "Cost price", "money"),
@@ -52,8 +55,10 @@ FIELDS = {
     "sub": [
         ("customer", "Customer", "text"),
         ("item", "Item", "text"),
-        ("phone", "Phone", "phone"),
+        ("platform", "Platform", "platform"),
+        ("phone", "WhatsApp", "phone"),
         ("tg_username", "Telegram", "tgname"),
+        ("ig_username", "Instagram", "igname"),
         ("start_date", "Start date", "date"),
         ("end_date", "End date", "enddate"),
         ("sold_price", "Sold price", "money"),
@@ -67,6 +72,7 @@ FIELDS = {
 }
 KIND_NAME = {"sale": "sale", "sub": "subscription"}
 PAYMENT_PRESETS = {"cash": "Cash", "upi": "UPI", "card": "Card"}
+PLATFORM_TOKENS = {"wa": "WhatsApp", "tg": "Telegram", "ig": "Instagram"}
 USAGE = (
     "✏️ <b>Edit an entry</b>\n\n"
     "• A sale: <code>/editsale &lt;id&gt;</code>  (IDs via /sales)\n"
@@ -96,9 +102,11 @@ def _summary(kind: str, row) -> str:
     lines = [f"✏️ <b>Editing {KIND_NAME[kind]} #{row['id']}</b>", ""]
     lines.append(f"<b>Item:</b> {_show(row['item'])}")
     lines.append(f"<b>Customer:</b> {_show(row['customer'])}")
+    lines.append(f"<b>Bought via:</b> {_show(row.get('platform'))}")
+    lines.append(f"<b>WhatsApp:</b> {'+' + esc(row['phone']) if row.get('phone') else '—'}")
     lines.append(f"<b>Telegram:</b> {_tg_text(row)}")
+    lines.append(f"<b>Instagram:</b> {'@' + esc(row['ig_username']) if row.get('ig_username') else '—'}")
     if kind == "sub":
-        lines.append(f"<b>Phone:</b> {_show(row.get('phone'))}")
         lines.append(f"<b>Period:</b> {_show(row['start_date'])} → {_show(row['end_date'])}")
     else:
         lines.append(f"<b>Date:</b> {_show(row['sale_date'])}")
@@ -126,6 +134,18 @@ def _tg_text(row) -> str:
     if tid:
         return f"ID {tid} (username not found yet)"
     return "—"
+
+
+def _missing_contact_field(row):
+    """For WhatsApp/Telegram/Instagram: the contact field to fill in if it's still empty, else None."""
+    platform = row.get("platform")
+    if platform == "WhatsApp" and not row.get("phone"):
+        return "phone"
+    if platform == "Telegram" and not (row.get("tg_id") or row.get("tg_username")):
+        return "tg_username"
+    if platform == "Instagram" and not row.get("ig_username"):
+        return "ig_username"
+    return None
 
 
 def _keyboard(kind: str) -> InlineKeyboardMarkup:
@@ -219,6 +239,18 @@ def _prompt_for(kind: str, column: str, row) -> tuple:
         text += ("Send the phone number (with country code, or just 10 digits), "
                  "or tap Clear to remove it:")
         rows.append([InlineKeyboardButton("🗑 Clear", callback_data="ed:clear")])
+    elif vtype == "igname":
+        text += "Send their Instagram username (like @alice.shop), or tap Clear to remove it:"
+        rows.append([InlineKeyboardButton("🗑 Clear", callback_data="ed:clear")])
+    elif vtype == "platform":
+        text += "Tap where they bought from, or type another platform name:"
+        rows.append([
+            InlineKeyboardButton("📱 WhatsApp", callback_data="ed:v:wa"),
+            InlineKeyboardButton("✈️ Telegram", callback_data="ed:v:tg"),
+            InlineKeyboardButton("📸 Instagram", callback_data="ed:v:ig"),
+        ])
+        rows.append([InlineKeyboardButton("🌐 Other (type it)", callback_data="ed:v:other"),
+                     InlineKeyboardButton("🗑 Clear", callback_data="ed:clear")])
     elif vtype == "tgname":
         text += ("Send their <b>numeric Telegram ID</b> (best: I fetch the username and keep it updated; "
                  "they get it by sending /myid to this bot), or just their @username.\n"
@@ -293,7 +325,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, vtype = _field_info(kind, column)
 
     if data == "ed:clear":
-        if vtype not in ("text_opt", "phone", "tgname"):
+        if vtype not in ("text_opt", "phone", "tgname", "igname", "platform"):
             return VALUE
         if vtype == "tgname":
             return await _apply(update, context, {"tg_username": None, "tg_id": None})
@@ -308,6 +340,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return VALUE
             if token in PAYMENT_PRESETS:
                 return await _apply(update, context, {column: PAYMENT_PRESETS[token]})
+        if vtype == "platform":
+            if token == "other":
+                st["await_other"] = True
+                await reply_to(update, "✏️ Type the platform name (e.g. Facebook, Website, Walk-in):")
+                return VALUE
+            if token in PLATFORM_TOKENS:
+                return await _apply(update, context, {column: PLATFORM_TOKENS[token]})
         if vtype == "paid" and token == "full":
             row = db.get_entry(kind, st["id"])
             return await _apply(update, context, {column: row["sold_price"]})
@@ -362,6 +401,18 @@ def _parse_value(kind: str, column: str, vtype: str, text: str, row) -> object:
                 "I couldn't read that. Send their numeric Telegram ID (digits only) or their @username, "
                 "or tap Clear to remove it."
             )
+    if vtype == "igname":
+        if text.strip() in ("-", "—"):
+            return None
+        try:
+            return normalize_ig_username(text)
+        except ValueError:
+            raise ValueError(
+                "That doesn't look like an Instagram username. Send it like @alice.shop "
+                "(letters, numbers, dots and underscores), or tap Clear to remove it."
+            )
+    if vtype == "platform":
+        return normalize_platform(text)
     if vtype == "payment":
         return _parse_text(text, "payment method", maxlen=40)
     if vtype == "money":
@@ -466,6 +517,15 @@ async def _apply(update: Update, context: ContextTypes.DEFAULT_TYPE, changes: di
     resync_sheets_in_background()
     column = "tg_username" if ("tg_id" in changes or "tg_username" in changes) else next(iter(changes))
     label, _ = _field_info(kind, column)
+    if column == "platform" and changes.get("platform"):
+        target = _missing_contact_field(new_row)
+        if target:
+            st["field"] = target
+            st["await_other"] = False
+            text, markup = _prompt_for(kind, target, new_row)
+            await reply_to(update, f"✅ Platform updated to <b>{esc(changes['platform'])}</b>. "
+                                   f"Now their contact there:\n\n{text}", reply_markup=markup)
+            return VALUE
     return await _show_menu(update, context, prefix=f"✅ {label} updated." + (f"\n{notes}" if notes else "") + "\n\n")
 
 
