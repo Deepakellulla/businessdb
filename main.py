@@ -30,8 +30,8 @@ from config import (
 )
 from helpers import (
     ack, display_name, esc, is_lifetime_duration, money, normalize_phone,
-    reply_document_to, reply_long, reply_to, require_auth, resync_sheets_in_background, telegram_link,
-    whatsapp_link,
+    instagram_link, reply_document_to, reply_long, reply_to, require_auth, resync_sheets_in_background,
+    telegram_link, whatsapp_link,
 )
 
 logging.basicConfig(
@@ -409,9 +409,15 @@ async def customer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Total revenue: {profile['total_revenue']:.2f} | Total profit: <b>{profile['total_profit']:.2f}</b>",
     ]
 
+    platform = db.customer_platform(name)
+    if platform:
+        lines.append(f"🛒 Buys via {esc(platform)}")
     phone = db.customer_phone(name)
     if phone:
-        lines.append(f"📞 +{phone}")
+        lines.append(f"📱 WhatsApp: +{phone}")
+    ig = db.customer_ig(name)
+    if ig:
+        lines.append(f"📸 @{esc(ig)}")
     tg = db.customer_tg(name)
     if tg:
         if tg["tg_username"]:
@@ -572,7 +578,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sales:
         sales_csv = _rows_to_csv_bytes(
-            sales, ["id", "sale_date", "item", "customer", "tg_username", "tg_id", "seller", "supplier", "gross_price", "discount",
+            sales, ["id", "sale_date", "item", "customer", "platform", "phone", "tg_username", "tg_id", "ig_username", "seller", "supplier", "gross_price", "discount",
                     "sold_price", "cost_price", "profit", "amount_paid", "balance_due",
                     "payment_method", "logged_by"]
         )
@@ -587,7 +593,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if subs:
         subs_csv = _rows_to_csv_bytes(
             subs,
-            ["id", "customer", "phone", "tg_username", "tg_id", "item", "seller", "supplier", "gross_price", "discount",
+            ["id", "customer", "platform", "phone", "tg_username", "tg_id", "ig_username", "item", "seller", "supplier", "gross_price", "discount",
              "sold_price", "cost_price", "profit", "amount_paid", "balance_due",
              "start_date", "end_date", "active", "payment_method", "logged_by"],
         )
@@ -761,16 +767,7 @@ async def expiring_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             when = f"ends {r['end_date']} ({left}d)"
         lines.append(f"• #{r['id']} <b>{esc(r['customer'])}</b> — {esc(r['item'])} — {when}{_contact(r)}{_tags(r)}")
-        contact_row = []
-        if r.get("phone"):
-            contact_row.append(InlineKeyboardButton(
-                f"💬 {r['customer'][:22]}",
-                url=whatsapp_link(r["phone"], r["customer"], r["item"], r["end_date"]),
-            ))
-        if r.get("tg_username"):
-            contact_row.append(InlineKeyboardButton(
-                f"✈️ {r['customer'][:22]}", url=telegram_link(r["tg_username"]),
-            ))
+        contact_row = _contact_buttons(r, short=True)
         if contact_row and len(buttons) < 8:
             buttons.append(contact_row)
     lines.append("\n🔁 Renew with <code>/renew &lt;id&gt;</code> (add <code>due</code> if they haven't paid yet).")
@@ -977,10 +974,10 @@ async def setphone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     n = db.set_customer_phone(name, phone)
     if not n:
-        await reply_to(update, f"No subscriptions found for “{esc(name)}”. The name has to match — try /search {esc(name)}.")
+        await reply_to(update, f"No entries found for “{esc(name)}”. The name has to match — try /search {esc(name)}.")
         return
     resync_sheets_in_background()
-    await reply_to(update, f"📞 Saved +{phone} on {n} subscription{'s' if n != 1 else ''} for <b>{esc(name)}</b>. "
+    await reply_to(update, f"📱 Saved +{phone} on {n} entr{'y' if n == 1 else 'ies'} for <b>{esc(name)}</b>. "
                            "Their reminders will now have a WhatsApp button.")
 
 
@@ -1044,15 +1041,43 @@ async def morning_summary(context: ContextTypes.DEFAULT_TYPE):
 # ================= reminder job =================
 
 def _contact(r) -> str:
-    """' · 📞 +91… · ✈️ @alice' for list views (empty when the customer has neither)."""
+    """' · 🛒 Telegram · ✈️ @alice' for list views: the platform plus whatever contact is saved."""
     bits = []
+    if r.get("platform"):
+        bits.append(f"🛒 {esc(r['platform'])}")
     if r.get("phone"):
-        bits.append(f"📞 +{r['phone']}")
+        bits.append(f"📱 +{r['phone']}")
     if r.get("tg_username"):
         bits.append(f"✈️ @{esc(r['tg_username'])}")
     elif r.get("tg_id"):
         bits.append(f"✈️ ID {r['tg_id']}")
+    if r.get("ig_username"):
+        bits.append(f"📸 @{esc(r['ig_username'])}")
     return " · " + " · ".join(bits) if bits else ""
+
+
+def _contact_buttons(r, short: bool = False) -> list:
+    """
+    One tap-to-open button per contact the customer has (WhatsApp / Telegram / Instagram), with the
+    platform they bought from first. short=True uses the customer's name as the label (for lists).
+    """
+    name = (r.get("customer") or "")[:22]
+    buttons = []
+    if r.get("phone"):
+        buttons.append(("WhatsApp", InlineKeyboardButton(
+            f"💬 {name}" if short else "💬 WhatsApp the customer",
+            url=whatsapp_link(r["phone"], r["customer"], r["item"], r["end_date"]),
+        )))
+    if r.get("tg_username"):
+        buttons.append(("Telegram", InlineKeyboardButton(
+            f"✈️ {name}" if short else "✈️ Message on Telegram", url=telegram_link(r["tg_username"]),
+        )))
+    if r.get("ig_username"):
+        buttons.append(("Instagram", InlineKeyboardButton(
+            f"📸 {name}" if short else "📸 Open Instagram", url=instagram_link(r["ig_username"]),
+        )))
+    buttons.sort(key=lambda pb: pb[0] != r.get("platform"))  # their own platform first
+    return [b for _, b in buttons]
 
 
 def _reminder_keyboard(sub) -> InlineKeyboardMarkup:
@@ -1060,15 +1085,7 @@ def _reminder_keyboard(sub) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔁 Renew (paid)", callback_data=f"renew:{sub['id']}:paid"),
         InlineKeyboardButton("🕓 Renew (pay later)", callback_data=f"renew:{sub['id']}:due"),
     ]]
-    if sub.get("phone"):
-        rows.append([InlineKeyboardButton(
-            "💬 WhatsApp the customer",
-            url=whatsapp_link(sub["phone"], sub["customer"], sub["item"], sub["end_date"]),
-        )])
-    if sub.get("tg_username"):
-        rows.append([InlineKeyboardButton(
-            "✈️ Message on Telegram", url=telegram_link(sub["tg_username"]),
-        )])
+    rows += [[b] for b in _contact_buttons(sub)]
     return InlineKeyboardMarkup(rows)
 
 
