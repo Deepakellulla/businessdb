@@ -151,6 +151,43 @@ def parse_tg_contact(text: str) -> dict:
         )
 
 
+_IG_USERNAME_RE = re.compile(r"^(?!\.)(?!.*\.\.)(?!.*\.$)[A-Za-z0-9._]{1,30}$")
+
+
+def normalize_ig_username(text: str) -> str:
+    """'@alice.s', 'alice.s' or 'instagram.com/alice.s/' -> 'alice.s' (lowercase, no @)."""
+    t = (text or "").strip()
+    t = re.sub(r"^(https?://)?(www\.)?(instagram\.com|instagr\.am)/", "", t, flags=re.IGNORECASE)
+    t = t.split("?")[0].split("/")[0].lstrip("@").strip()
+    if not _IG_USERNAME_RE.match(t):
+        raise ValueError(
+            "That doesn't look like an Instagram username. Send it like @alice.shop "
+            "(letters, numbers, dots and underscores, up to 30 characters), or tap Skip."
+        )
+    return t.lower()
+
+
+def instagram_link(username: str) -> str:
+    return f"https://instagram.com/{username}"
+
+
+PLATFORMS = ("WhatsApp", "Telegram", "Instagram")
+
+
+def normalize_platform(text: str) -> str:
+    """'whatsapp' / 'WA' / 'insta' / 'ig' / 'tg' -> the standard name; anything else is kept as typed (e.g. 'Facebook')."""
+    t = (text or "").strip()
+    if not t:
+        raise ValueError("Please type the platform name, e.g. Facebook or Walk-in.")
+    if len(t) > 30:
+        raise ValueError("That's too long for a platform name (max 30 characters).")
+    key = t.lower().replace(" ", "")
+    aliases = {"whatsapp": "WhatsApp", "wa": "WhatsApp", "whatsap": "WhatsApp", "telegram": "Telegram",
+               "tg": "Telegram", "telegrm": "Telegram", "instagram": "Instagram", "insta": "Instagram",
+               "ig": "Instagram"}
+    return aliases.get(key, t)
+
+
 def telegram_link(username: str) -> str:
     """t.me link that opens a chat with this username."""
     return f"https://t.me/{username}"
