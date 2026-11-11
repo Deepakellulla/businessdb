@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 SALES_HEADERS = [
-    "ID", "Date", "Item", "Customer", "Telegram", "Seller", "Supplier", "Gross Price", "Discount",
+    "ID", "Date", "Item", "Customer", "Platform", "WhatsApp", "Telegram", "Instagram", "Seller", "Supplier",
+    "Gross Price", "Discount",
     "Sold Price", "Cost Price", "Profit", "Amount Paid", "Balance Due",
     "Payment Method", "Logged By",
 ]
 SUBS_HEADERS = [
-    "ID", "Customer", "Phone", "Telegram", "Item", "Seller", "Supplier", "Gross Price", "Discount",
+    "ID", "Customer", "Platform", "WhatsApp", "Telegram", "Instagram", "Item", "Seller", "Supplier",
+    "Gross Price", "Discount",
     "Sold Price", "Cost Price", "Profit", "Amount Paid", "Balance Due",
     "Start Date", "End Date", "Active", "Payment Method", "Logged By",
 ]
@@ -78,6 +80,14 @@ def _balance(s: dict) -> float:
     return round(max(s["sold_price"] - _paid(s), 0.0), 2)
 
 
+def _phone_cell(s: dict) -> str:
+    return f"+{s['phone']}" if s.get("phone") else ""
+
+
+def _ig_cell(s: dict) -> str:
+    return f"@{s['ig_username']}" if s.get("ig_username") else ""
+
+
 def _tg_cell(s: dict) -> str:
     if s.get("tg_username"):
         return f"@{s['tg_username']}"
@@ -86,8 +96,8 @@ def _tg_cell(s: dict) -> str:
 
 def _sale_row(s: dict) -> list:
     return [
-        s["id"], s["sale_date"], s["item"], s["customer"] or "",
-        _tg_cell(s), s.get("seller") or "",
+        s["id"], s["sale_date"], s["item"], s["customer"] or "", s.get("platform") or "",
+        _phone_cell(s), _tg_cell(s), _ig_cell(s), s.get("seller") or "",
         s.get("supplier") or "", s["gross_price"], s["discount"], s["sold_price"], s["cost_price"],
         s["profit"], _paid(s), _balance(s), s["payment_method"] or "", s["logged_by"] or "",
     ]
@@ -95,8 +105,8 @@ def _sale_row(s: dict) -> list:
 
 def _sub_row(s: dict) -> list:
     return [
-        s["id"], s["customer"], (f"+{s['phone']}" if s.get("phone") else ""),
-        _tg_cell(s), s["item"],
+        s["id"], s["customer"], s.get("platform") or "", _phone_cell(s),
+        _tg_cell(s), _ig_cell(s), s["item"],
         s.get("seller") or "", s.get("supplier") or "", s["gross_price"], s["discount"],
         s["sold_price"], s["cost_price"], s["profit"], _paid(s), _balance(s),
         s["start_date"], s["end_date"], "Yes" if s["active"] else "No",
