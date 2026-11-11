@@ -101,8 +101,10 @@ def init_db():
             ("seller", "TEXT"), ("supplier", "TEXT"),
             ("amount_paid", "DOUBLE PRECISION"), ("created_at", "TIMESTAMPTZ"),
             ("tg_username", "TEXT"), ("tg_id", "BIGINT"),
+            # where the customer bought from (WhatsApp / Telegram / Instagram / other) + their contact there
+            ("platform", "TEXT"), ("ig_username", "TEXT"), ("phone", "TEXT"),
         ]
-        sub_only_cols = [("phone", "TEXT"), ("renewed_to", "INTEGER")]
+        sub_only_cols = [("renewed_to", "INTEGER")]
         for table, new_cols in (
             ("sales", common_cols),
             ("subscriptions", common_cols + sub_only_cols),
@@ -159,7 +161,8 @@ def _iso(d):
 
 def add_sale(item, customer, sold_price, cost_price, logged_by=None,
              discount=0.0, gross_price=None, payment_method=None,
-             sale_date=None, seller=None, supplier=None, amount_paid=None, tg_username=None, tg_id=None):
+             sale_date=None, seller=None, supplier=None, amount_paid=None, tg_username=None, tg_id=None,
+             platform=None, ig_username=None, phone=None):
     """
     sold_price = final/net amount actually received (after discount).
     gross_price = list price before discount; if not given, computed as sold_price + discount.
@@ -174,10 +177,12 @@ def add_sale(item, customer, sold_price, cost_price, logged_by=None,
         cur = conn.execute(
             "INSERT INTO sales "
             "(item, customer, sold_price, cost_price, profit, sale_date, logged_by, "
-            " discount, gross_price, payment_method, seller, supplier, amount_paid, tg_username, tg_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            " discount, gross_price, payment_method, seller, supplier, amount_paid, tg_username, tg_id, "
+            " platform, ig_username, phone) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (item, customer, sold_price, cost_price, profit, _iso(sale_date), logged_by,
-             discount, gross_price, payment_method, seller, supplier, amount_paid, tg_username, tg_id),
+             discount, gross_price, payment_method, seller, supplier, amount_paid, tg_username, tg_id,
+             platform, ig_username, phone),
         )
         new_id = cur.fetchone()["id"]
         conn.commit()
@@ -307,7 +312,7 @@ def discount_summary(since_date: str = None):
 def add_subscription(customer, item, sold_price, cost_price, start_date: date, duration_days: int,
                       logged_by=None, discount=0.0, gross_price=None, payment_method=None,
                       seller=None, supplier=None, amount_paid=None, phone=None, tg_username=None,
-                      tg_id=None):
+                      tg_id=None, platform=None, ig_username=None):
     end_date = start_date.fromordinal(start_date.toordinal() + duration_days)
     if gross_price is None:
         gross_price = sold_price + discount
@@ -319,12 +324,12 @@ def add_subscription(customer, item, sold_price, cost_price, start_date: date, d
             "INSERT INTO subscriptions "
             "(customer, item, sold_price, cost_price, profit, start_date, end_date, logged_by, "
             " discount, gross_price, payment_method, seller, supplier, amount_paid, phone, tg_username, "
-            " tg_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            " tg_id, platform, ig_username) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (customer, item, sold_price, cost_price, profit,
              start_date.isoformat(), end_date.isoformat(), logged_by,
              discount, gross_price, payment_method, seller, supplier, amount_paid, phone, tg_username,
-             tg_id),
+             tg_id, platform, ig_username),
         )
         new_id = cur.fetchone()["id"]
         conn.commit()
@@ -356,10 +361,12 @@ _EDITABLE = {
     "sale": ("sales", {
         "item", "customer", "sale_date", "sold_price", "cost_price", "discount",
         "payment_method", "amount_paid", "seller", "supplier", "tg_username", "tg_id",
+        "platform", "ig_username", "phone",
     }),
     "sub": ("subscriptions", {
         "item", "customer", "phone", "start_date", "end_date", "sold_price", "cost_price",
         "discount", "payment_method", "amount_paid", "seller", "supplier", "tg_username", "tg_id",
+        "platform", "ig_username",
     }),
 }
 
@@ -862,15 +869,52 @@ def top_sellers(limit=5):
         ).fetchall()
 
 
-def customer_phone(name: str):
-    """Most recent phone number saved for this customer (case-insensitive), or None."""
+def customer_phone(name):
+    """Most recent phone/WhatsApp number saved for this customer (case-insensitive), or None."""
+    if not name:
+        return None
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT phone FROM subscriptions WHERE LOWER(customer) = LOWER(%s) "
-            "AND COALESCE(phone, '') <> '' ORDER BY id DESC LIMIT 1",
-            (name,),
-        ).fetchone()
-        return row["phone"] if row else None
+        for table in ("subscriptions", "sales"):
+            row = conn.execute(
+                f"SELECT phone FROM {table} WHERE LOWER(customer) = LOWER(%s) "
+                "AND COALESCE(phone, '') <> '' ORDER BY id DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+            if row:
+                return row["phone"]
+    return None
+
+
+def customer_ig(name):
+    """Most recent Instagram username saved for this customer (case-insensitive), or None."""
+    if not name:
+        return None
+    with get_conn() as conn:
+        for table in ("subscriptions", "sales"):
+            row = conn.execute(
+                f"SELECT ig_username FROM {table} WHERE LOWER(customer) = LOWER(%s) "
+                "AND COALESCE(ig_username, '') <> '' ORDER BY id DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+            if row:
+                return row["ig_username"]
+    return None
+
+
+def customer_platform(name):
+    """The platform this customer bought from last time (e.g. 'WhatsApp'), or None."""
+    if not name:
+        return None
+    with get_conn() as conn:
+        for table in ("subscriptions", "sales"):
+            row = conn.execute(
+                f"SELECT platform FROM {table} WHERE LOWER(customer) = LOWER(%s) "
+                "AND COALESCE(platform, '') <> '' ORDER BY id DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+            if row:
+                return row["platform"]
+    return None
 
 
 def customer_tg(name):
@@ -947,13 +991,16 @@ def set_tg_username_for_id(tg_id: int, new_username):
 
 
 def set_customer_phone(name: str, phone: str) -> int:
-    """Sets the phone on every subscription of this customer. Returns rows updated."""
+    """Sets the phone on every subscription and sale of this customer. Returns rows updated."""
+    total = 0
     with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE subscriptions SET phone=%s WHERE LOWER(customer) = LOWER(%s)", (phone, name)
-        )
+        for table in ("subscriptions", "sales"):
+            cur = conn.execute(
+                f"UPDATE {table} SET phone=%s WHERE LOWER(customer) = LOWER(%s)", (phone, name)
+            )
+            total += cur.rowcount
         conn.commit()
-        return cur.rowcount
+    return total
 
 
 # ---------- payments owed ----------
@@ -1041,7 +1088,7 @@ def renew_subscription(sub_id: int, paid: bool = True, logged_by=None, today: da
         logged_by=logged_by, discount=old["discount"] or 0.0, gross_price=old["gross_price"],
         payment_method=old["payment_method"], seller=old["seller"], supplier=old["supplier"],
         amount_paid=sold if paid else 0.0, phone=old["phone"], tg_username=old.get("tg_username"),
-        tg_id=old.get("tg_id"),
+        tg_id=old.get("tg_id"), platform=old.get("platform"), ig_username=old.get("ig_username"),
     )
     with get_conn() as conn:
         cur = conn.execute(
