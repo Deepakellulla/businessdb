@@ -43,6 +43,7 @@ automatically reminds you before — and when — a subscription ends.
 
 **Data**
 - `/export` (CSV) · `/backup` (JSON, includes products) · `/syncsheets` (see Google Sheets below)
+- `/newtrial`, `/trials`, `/deltrial` — free trials (see *Free trials*) · `/compensate`, `/compensations` — add days after an outage (see *Outage compensation*) · `/health`, `/testalert` — alerts (see *Alerts when something breaks*)
 - `/syncusernames` — re-check every saved Telegram ID right now and update any changed usernames (see *Customers' Telegram* below)
 - `/editsale <id>` / `/editsub <id>` (or `/edit sale <id>` / `/edit sub <id>`) — open an entry and change **any field** (item, customer, Telegram username, date, prices, discount, payment method, amount paid, seller, supplier; for subscriptions also phone, start and end date). Tap a field, send the new value, repeat, then tap Done. Profit, gross price and the paid/due amount are recalculated automatically.
 - `/deletesale <id>` / `/deletesub <id>` — remove an entry (find IDs in `/sales`, `/subs`, `/dues`)
@@ -167,6 +168,51 @@ cp .env.example .env   # then edit BOT_TOKEN and DATABASE_URL
 # run permanently with systemd or:
 nohup python main.py &
 ```
+
+## Free trials
+
+For customers who try before they pay.
+
+- `/newtrial` — customer, where they came from (and their contact), product, trial length (1/3/7/14 days or type it) and what the trial costs you. Review, confirm.
+- **Reminders** — the day before a trial ends, and on the last day, you get a message with **🔁 Convert to paid** and **🙅 Not interested** buttons plus tap-to-message buttons (WhatsApp with the text already written, Telegram, Instagram).
+- **🔁 Convert to paid** opens a new-subscription form with customer, platform, contact, product and seller already filled in (and price/cost/duration too if the product is saved with `/addproduct`). When you confirm, the trial is marked converted.
+- Logging a normal `/newsub` for the same customer and product also marks their trial converted automatically.
+- `/trials` — running trials, ended ones waiting for a decision, and the numbers for the last 90 days (started / converted / lost, **conversion rate**, total trial cost). Trials nobody decided on for 14 days after they ended count as lost. The morning summary mentions trials that need attention.
+- `/deltrial <id>` removes one logged by mistake. Trials are included in `/backup`.
+
+## Outage compensation (owner)
+
+A product was down for 2 days → add 2 days to everyone who has it, in one go.
+
+- `/compensate` (guided) or `/compensate 2 Netflix` (days + product up front; `/compensate Netflix 2` and partial names like `netf` work too). Then an optional **reason** and whether to **notify** customers.
+- It extends every subscription of that product that is **running right now** — not ones that already ended, haven't started, were replaced by a renewal, or are lifetime. Reminders are re-armed for the new end dates, and the Google Sheet is refreshed.
+- **Notifying**: customers with a saved Telegram ID who have started your bot are messaged automatically ("Hi Ann! Netflix had a service outage, so we've added 2 days… your new end date is …"). For everyone else you get a row of buttons that open WhatsApp / Telegram / Instagram **with that message already written** — one tap each. People with no contact saved are listed by name.
+- Every compensation is saved and gets an **↩️ Undo** button (owner only, works once; it takes the days back off from each subscription's *current* end date, so edits you made later are kept). `/compensations` lists recent ones. The change is all-or-nothing: if anything fails half-way, nothing is changed.
+
+## Duplicate warning
+
+When you tap **Confirm & Save** and the entry looks like one already saved, the bot stops and shows it first:
+
+- **Customer given:** same customer + product + date as an existing sale/subscription (capital letters ignored). Also checked for new trials (a customer with a running trial of the same product).
+- **Walk-in sale (no customer):** same product, date and price, logged by the same person in the last 10 minutes — the classic double-tap.
+- Buttons: **✅ Save anyway**, **📝 Back to review**, **❌ Cancel**. It never blocks you for good, and if the check itself fails the entry just saves.
+
+## Alerts when something breaks
+
+The bot messages **you** (the owner) when something goes wrong, so you find out in minutes instead of when a customer complains:
+
+- an error while handling any command or button — with *what was being done* (e.g. `sent: /editsub 5`, by whom), the error and the file/line;
+- a failed save, a failed Google Sheets sync, a failed daily job (reminders, summary, username check);
+- the database becoming unreachable — and a 🟢 message when it's back;
+- a second copy of the bot running (Telegram "409 Conflict" — the cause of commands randomly doing nothing);
+- an unstable connection to Telegram (only after several errors in a few minutes — one-off timeouts are normal);
+- the bot crashing on start-up or while running.
+
+It won't flood you: the same error is reported once per 15 minutes (with a "+N more" count), and there's a cap of 12 alerts an hour. Passwords and tokens are stripped from every alert.
+
+- `/testalert` sends a test alert through the real path so you know it will reach you. `/health` shows database status, uptime and recent errors.
+- **When the whole bot is down** it can't tell you itself. For that, make a free check at [healthchecks.io](https://healthchecks.io) (period 10 min, grace 10 min), put its ping URL in `HEALTHCHECK_URL`, and add your email/Telegram as the alert channel. The bot pings it every 5 minutes (and pings the `/fail` address when the database is down); if the pings stop, healthchecks.io alerts you.
+- Optional `OWNER_CHAT_ID` (your ID from `/myid`) lets the bot alert you even if the database is the thing that's down.
 
 ## Where the customer bought from (platform + contact)
 
