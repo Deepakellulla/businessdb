@@ -18,19 +18,22 @@ from telegram.ext import (
     ContextTypes,
 )
 
+import alerts
 import assign
+import compensation
 import db
 import editentry
 import flow
 import sheets
 import tgsync
+import trials
 from config import (
     BOT_TOKEN, REMINDER_HOUR, REMINDER_MINUTE, REMINDER_DAYS_BEFORE,
-    MORNING_SUMMARY_HOUR, MORNING_SUMMARY_MINUTE, TG_SYNC_HOUR, TG_SYNC_MINUTE, TIMEZONE, TZINFO,
+    HEALTH_CHECK_SECONDS, MORNING_SUMMARY_HOUR, MORNING_SUMMARY_MINUTE, TG_SYNC_HOUR, TG_SYNC_MINUTE, TIMEZONE, TZINFO,
 )
 from helpers import (
     ack, display_name, esc, is_lifetime_duration, money, normalize_phone,
-    instagram_link, reply_document_to, reply_long, reply_to, require_auth, resync_sheets_in_background,
+    instagram_link, is_owner, reply_document_to, reply_long, reply_to, require_auth, resync_sheets_in_background,
     telegram_link, whatsapp_link,
 )
 
@@ -62,9 +65,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Tap the menu button (☰) next to the text box any time, or send /menu "
         "for a button-based menu.\n\n"
         "<b>Log</b>\n"
-        "🧾 /newsale · 📋 /newsub · ↩️ /undo (take back your last entry)\n\n"
+        "🧾 /newsale · 📋 /newsub · 🧪 /newtrial · ↩️ /undo (take back your last entry)\n\n"
         "<b>Money owed &amp; renewals</b>\n"
-        "🔴 /dues · 💰 /receive · ⏳ /expiring · 🔁 /renew · 📞 /setphone\n\n"
+        "🔴 /dues · 💰 /receive · ⏳ /expiring · 🔁 /renew · 📞 /setphone\n"
+        "🧪 /trials · 🛠 /compensate (add days after an outage) · /compensations\n\n"
         "<b>Reports</b>\n"
         "☀️ /summary · 📊 /stats · 📅 /monthly · 🏆 /top · 📈 /abc · ♻️ /renewal · 🏭 /suppliers\n"
         "👤 /customer &lt;name&gt; · 🔍 /search &lt;keyword&gt;\n\n"
@@ -72,6 +76,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📦 /products · /addproduct · /delproduct\n"
         "🧑‍💼 /assignseller · /setseller (add sellers to older entries)\n"
         "📤 /export · 💾 /backup · 📊 /syncsheets · ✈️ /syncusernames\n"
+        "🩺 /health · 🧪 /testalert (owner: check that error alerts reach you)\n"
         "🛠 /edit, /editsale, /deletesale, /editsub, /deletesub\n"
         "👥 /myid, /addstaff, /removestaff, /staff\n"
         "❌ /cancel — cancel current input",
@@ -199,8 +204,9 @@ async def staff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= /edit helper & global error handler =================
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    """Log every unhandled exception and tell the user instead of staying silent."""
-    logger.error("Unhandled error while handling an update", exc_info=context.error)
+    """Log every unhandled exception, alert the owner, and tell the user instead of staying silent."""
+    where = "a scheduled job" if not isinstance(update, Update) else "handling a message or button"
+    await alerts.report(context.error, where, update if isinstance(update, Update) else None)
     if isinstance(update, Update):
         try:
             if update.callback_query:
@@ -619,7 +625,7 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         caption=(
             f"💾 Full backup as of {date.today().isoformat()} — "
-            f"{len(data['sales'])} sales, {len(data['subscriptions'])} subscriptions"
+            f"{len(data['sales'])} sales, {len(data['subscriptions'])} subscriptions, {len(data['trials'])} trials"
         ),
     )
 
@@ -1013,9 +1019,12 @@ def build_summary(today: date) -> str:
             lines.append(f"• #{r['id']} {esc(r['customer'])} — {esc(r['item'])} — {when}")
         if len(expiring) > 6:
             lines.append(f"…and {len(expiring) - 6} more — /expiring")
+    trial_line = trials.attention_line(today)
+    if trial_line:
+        lines.append("\n" + trial_line)
     if owed > 0.005:
         lines.append(f"\n🔴 <b>Owed to you:</b> {money(owed)} across {len(sales_due) + len(subs_due)} entries — /dues")
-    if not (expiring or owed > 0.005):
+    if not (expiring or owed > 0.005 or trial_line):
         lines.append("\n✅ Nothing expiring this week and nobody owes you money.")
     return "\n".join(lines)
 
@@ -1034,8 +1043,8 @@ async def morning_summary(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=owner_id, text=build_summary(date.today()), parse_mode=ParseMode.HTML
         )
-    except Exception:
-        logger.exception("Morning summary failed")
+    except Exception as e:
+        await alerts.report(e, "Morning summary")
 
 
 # ================= reminder job =================
@@ -1121,6 +1130,37 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         )
         db.mark_reminded_due(sub["id"])
 
+    try:
+        await trials.send_trial_reminders(context.bot, owner_id, today)
+    except Exception as e:  # a trial problem must never stop the subscription reminders above
+        await alerts.report(e, "Free-trial reminders")
+
+
+# ================= health & alert commands =================
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth(update):
+        return
+    if not is_owner(update):
+        await reply_to(update, "Only the owner can see the bot's health.")
+        return
+    await reply_to(update, await alerts.health_text())
+
+
+async def testalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a pretend error through the real alert path, so you know alerts will reach you."""
+    if not await require_auth(update):
+        return
+    if not is_owner(update):
+        await reply_to(update, "Only the owner can send a test alert.")
+        return
+    try:
+        raise RuntimeError("This is a test alert — nothing is actually wrong 🙂")
+    except RuntimeError as e:
+        await alerts.report(e, "Test alert (/testalert)", update, force=True)
+    await reply_to(update, "🧪 Test alert sent. If it didn't arrive as a separate message, tell me — "
+                           "then alerts aren't reaching you.")
+
 
 # ================= app setup =================
 
@@ -1153,6 +1193,12 @@ COMMAND_MENU = [
     ("backup", "Download database backup"),
     ("syncsheets", "Push all data to Google Sheets"),
     ("syncusernames", "Refresh customers' Telegram usernames"),
+    ("newtrial", "Log a free trial"),
+    ("trials", "Free trials & how many convert"),
+    ("compensate", "Add days after an outage (owner)"),
+    ("compensations", "Recent outage compensations"),
+    ("health", "Is the bot healthy? (owner)"),
+    ("testalert", "Send a test alert (owner)"),
     ("edit", "Edit any field of a sale/subscription"),
     ("editsale", "Edit any field of a sale"),
     ("deletesale", "Remove a sale"),
@@ -1168,6 +1214,7 @@ COMMAND_MENU = [
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMAND_MENU])
+    alerts.set_owner(db.get_owner_chat_id())
     logger.info("Timezone: %s | reminders %02d:%02d | morning summary %s",
                 TIMEZONE, REMINDER_HOUR, REMINDER_MINUTE,
                 "off" if MORNING_SUMMARY_HOUR < 0 else f"{MORNING_SUMMARY_HOUR:02d}:{MORNING_SUMMARY_MINUTE:02d}")
@@ -1219,12 +1266,19 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("syncsheets", syncsheets_cmd))
     app.add_handler(CommandHandler("syncusernames", syncusernames_cmd))
+    app.add_handler(CommandHandler("trials", trials.trials_cmd))
+    app.add_handler(CommandHandler("deltrial", trials.deltrial_cmd))
+    app.add_handler(CommandHandler("compensations", compensation.compensations_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
+    app.add_handler(CommandHandler("testalert", testalert_cmd))
     app.add_handler(CommandHandler("deletesale", deletesale_cmd))
     app.add_handler(CommandHandler("deletesub", deletesub_cmd))
 
     # one-tap buttons
     app.add_handler(CallbackQueryHandler(renew_button, pattern=r"^renew:\d+:(paid|due)$"))
     app.add_handler(CallbackQueryHandler(undo_button, pattern=r"^undo:(sale|sub):\d+:(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(trials.lost_button, pattern=r"^tr:lost:\d+$"))
+    app.add_handler(CallbackQueryHandler(compensation.undo_button, pattern=r"^comp:undo:\d+$"))
     app.add_handler(CallbackQueryHandler(
         menu_callback,
         pattern="^menu:(stats|monthly|subs|sales|top|abc|renewal|export|backup|summary|dues|expiring|undo|suppliers)$",
@@ -1245,6 +1299,8 @@ def build_app() -> Application:
     app.job_queue.run_daily(
         check_reminders, time=dtime(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, tzinfo=TZINFO),
     )
+    if HEALTH_CHECK_SECONDS > 0:
+        app.job_queue.run_repeating(alerts.health_job, interval=HEALTH_CHECK_SECONDS, first=30)
     if TG_SYNC_HOUR >= 0:
         app.job_queue.run_daily(
             tgsync.sync_job, time=dtime(hour=TG_SYNC_HOUR, minute=TG_SYNC_MINUTE, tzinfo=TZINFO),
@@ -1259,10 +1315,14 @@ def build_app() -> Application:
 
 
 def main():
-    db.init_db()
-    app = build_app()
-    logger.info("Bot starting (polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        db.init_db()
+        app = build_app()
+        logger.info("Bot starting (polling)...")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:  # the process is about to die: tell the owner before it does
+        alerts.report_sync(e, "The bot stopped (start-up or crash)", force=True)
+        raise
 
 
 if __name__ == "__main__":
