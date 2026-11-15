@@ -13,6 +13,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import ContextTypes
 
+import alerts
 import db
 from helpers import esc, resync_sheets_in_background
 
@@ -93,8 +94,8 @@ async def sync_job(context: ContextTypes.DEFAULT_TYPE):
     """Daily job: refresh usernames, and message the owner only when something changed."""
     try:
         result = await sync_all(context.bot)
-    except Exception:
-        logger.exception("Telegram username sync failed")
+    except Exception as e:
+        await alerts.report(e, "Telegram username check")
         return
     logger.info(
         "Telegram username sync: %s checked, %s changed, %s can't be seen yet, %s errors",
