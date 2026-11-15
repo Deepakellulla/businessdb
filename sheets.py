@@ -225,5 +225,7 @@ def safe_full_resync(all_sales, all_subs):
     """Same as full_resync but never raises -- for background use after edits/deletes/payments."""
     try:
         full_resync(all_sales, all_subs)
-    except Exception:
+    except Exception as e:
         logger.exception("Background Google Sheets resync failed")
+        import alerts  # imported here: alerts -> db -> config, and sheets must stay importable on its own
+        alerts.report_sync(e, "Google Sheets sync")
