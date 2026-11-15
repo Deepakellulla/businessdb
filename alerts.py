@@ -44,6 +44,8 @@ CONFLICT_COOLDOWN = 60 * 60   # "two copies running" is reported at most hourly
 GLOBAL_LIMIT = 12             # alerts per hour, all kinds together
 NET_BURST = 5                 # this many network errors ...
 NET_WINDOW = 10 * 60          # ... within this many seconds counts as "unstable"
+CONFLICT_GRACE = 90           # a 409 must keep happening this long before it's reported: during a redeploy the
+                              # old copy overlaps the new one for a few seconds, which is harmless
 
 _owner_id = None
 _last_sent = {}               # signature -> [time last sent, how many were suppressed since]
@@ -51,6 +53,7 @@ _sent_times = deque()         # when each alert went out (for the hourly cap)
 _net_errors = deque()         # recent network-error times
 _recent = deque(maxlen=50)    # (time, signature, one-line summary) of recent errors, for /health
 _db_down = False
+_conflict = {"since": None, "last": 0.0}   # the current unbroken run of 409 errors
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -196,13 +199,22 @@ def _prepare(exc: BaseException, where: str = "", update=None, force: bool = Fal
     _recent.append((time.time(), sig, f"{type(exc).__name__}: {_redact(exc)}"[:200]))
 
     if isinstance(exc, Conflict):
+        now = time.time()
+        if _conflict["since"] is None or now - _conflict["last"] > 120:
+            _conflict["since"] = now           # a new run of conflicts starts
+        _conflict["last"] = now
+        if now - _conflict["since"] < CONFLICT_GRACE and not force:
+            return None                         # probably just a redeploy overlap -- wait and see
         ok, suppressed, capped = _allow("Conflict", CONFLICT_COOLDOWN)
         if not ok:
             return None
         return ("🚨 <b>Two copies of the bot are running</b>\n\n"
-                "Telegram reports a 409 Conflict: another instance is polling with the same bot token, so "
-                "commands will randomly go missing.\nStop the extra copy (an old deploy, a local run, "
-                f"a second service).\n\n🕒 {_now()}")
+                "Telegram has been reporting a 409 Conflict for over a minute: another instance is polling with "
+                "the same bot token, so commands randomly go missing.\n\n"
+                "Find and stop the extra copy: an old deployment or second service, or <code>python main.py</code> "
+                "still running on a computer. Not sure where it is? In @BotFather send /revoke, pick this bot, "
+                "then put the new token in BOT_TOKEN — that instantly kills every other copy.\n\n"
+                f"🕒 {_now()}")
 
     if isinstance(exc, NetworkError):  # includes TimedOut -- normal now and then, a problem in bursts
         now = time.time()
