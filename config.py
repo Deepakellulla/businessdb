@@ -45,6 +45,16 @@ MORNING_SUMMARY_MINUTE = int(os.getenv("MORNING_SUMMARY_MINUTE", "0"))
 TG_SYNC_HOUR = int(os.getenv("TG_SYNC_HOUR", "3"))
 TG_SYNC_MINUTE = int(os.getenv("TG_SYNC_MINUTE", "0"))
 
+# ---------- alerts when something breaks ----------
+# Optional: your Telegram user ID. Normally the bot reads it from the database, but if the database itself
+# is down it can't -- set this so you still get the "database unreachable" alert.
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
+# Optional: a https://healthchecks.io (or similar) ping URL. The bot pings it every few minutes; if the pings
+# STOP (bot crashed / host down) that service alerts you by email/SMS/Telegram -- the one failure the bot
+# can't report about itself.
+HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL")
+HEALTH_CHECK_SECONDS = int(os.getenv("HEALTH_CHECK_SECONDS", "300"))   # how often the DB check/ping runs; 0 = off
+
 # ---------- business rules ----------
 # The confirm screen warns when a sale's margin (profit / amount charged) is below this %.
 MIN_MARGIN_PCT = float(os.getenv("MIN_MARGIN_PCT", "10"))
