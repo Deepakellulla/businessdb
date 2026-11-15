@@ -207,6 +207,37 @@ def whatsapp_link(phone: str, customer: str, item: str, end_date: str) -> str:
     return f"https://wa.me/{phone}?text={quote(text)}"
 
 
+def whatsapp_text_link(phone: str, text: str) -> str:
+    """wa.me link that opens WhatsApp with this exact message typed out."""
+    return f"https://wa.me/{phone}?text={quote(text)}"
+
+
+def message_buttons(r: dict, whatsapp_text: str, short: bool = False) -> list:
+    """
+    One tap-to-open button per way we can reach this customer (WhatsApp / Telegram / Instagram),
+    with the platform they bought from first. `r` needs customer, platform, phone, tg_username, ig_username.
+    """
+    from telegram import InlineKeyboardButton
+    name = (r.get("customer") or "")[:22]
+    found = []
+    if r.get("phone"):
+        found.append(("WhatsApp", InlineKeyboardButton(
+            f"💬 {name}" if short else "💬 WhatsApp", url=whatsapp_text_link(r["phone"], whatsapp_text))))
+    if r.get("tg_username"):
+        found.append(("Telegram", InlineKeyboardButton(
+            f"✈️ {name}" if short else "✈️ Telegram", url=telegram_link(r["tg_username"]))))
+    if r.get("ig_username"):
+        found.append(("Instagram", InlineKeyboardButton(
+            f"📸 {name}" if short else "📸 Instagram", url=instagram_link(r["ig_username"]))))
+    found.sort(key=lambda pb: pb[0] != r.get("platform"))
+    return [b for _, b in found]
+
+
+def is_owner(update: Update) -> bool:
+    owner = db.get_owner_chat_id()
+    return owner is not None and update.effective_user is not None and update.effective_user.id == int(owner)
+
+
 # ---------- background Google Sheets syncing ----------
 # asyncio only keeps a weak reference to tasks, so a fire-and-forget task can be garbage
 # collected mid-flight unless we hold on to it ourselves.
