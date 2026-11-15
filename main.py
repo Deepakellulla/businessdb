@@ -37,6 +37,8 @@ from helpers import (
     telegram_link, whatsapp_link,
 )
 
+logging.getLogger("httpx").setLevel(logging.WARNING)      # its INFO lines contain the full bot token in the URL
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -205,7 +207,11 @@ async def staff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     """Log every unhandled exception, alert the owner, and tell the user instead of staying silent."""
-    where = "a scheduled job" if not isinstance(update, Update) else "handling a message or button"
+    if isinstance(update, Update):
+        where = "handling a message or button"
+    else:
+        job = getattr(context, "job", None)
+        where = f"scheduled job “{job.name}”" if job is not None else "a background task (Telegram connection)"
     await alerts.report(context.error, where, update if isinstance(update, Update) else None)
     if isinstance(update, Update):
         try:
