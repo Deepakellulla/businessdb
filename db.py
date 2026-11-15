@@ -1,6 +1,7 @@
 import psycopg2
 import psycopg2.extras
-from datetime import date
+import json
+from datetime import date, timedelta
 from contextlib import contextmanager
 
 from config import DATABASE_URL
@@ -25,7 +26,7 @@ class _ConnWrapper:
 
 @contextmanager
 def get_conn():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor, connect_timeout=15)
     try:
         yield _ConnWrapper(conn)
     finally:
@@ -90,6 +91,43 @@ def init_db():
                 default_cost DOUBLE PRECISION,
                 default_duration INTEGER,
                 default_supplier TEXT
+            )
+        """)
+        # free trials: a customer trying something before paying. status: active | converted | lost
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trials (
+                id SERIAL PRIMARY KEY,
+                customer TEXT NOT NULL,
+                item TEXT NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                cost_price DOUBLE PRECISION DEFAULT 0,
+                seller TEXT,
+                supplier TEXT,
+                logged_by TEXT,
+                platform TEXT,
+                phone TEXT,
+                tg_id BIGINT,
+                tg_username TEXT,
+                ig_username TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                converted_sub_id INTEGER,
+                reminded_soon INTEGER DEFAULT 0,
+                reminded_due INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        # outage compensations: "added N days to every running subscription of <item>"
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS compensations (
+                id SERIAL PRIMARY KEY,
+                item TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                reason TEXT,
+                logged_by TEXT,
+                affected TEXT NOT NULL,
+                undone INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT now()
             )
         """)
         conn.commit()
@@ -810,11 +848,15 @@ def full_backup_dict():
         staff = conn.execute("SELECT * FROM staff ORDER BY user_id").fetchall()
         settings = conn.execute("SELECT * FROM settings").fetchall()
         products = conn.execute("SELECT * FROM products ORDER BY id").fetchall()
+        trials = conn.execute("SELECT * FROM trials ORDER BY id").fetchall()
+        compensations = conn.execute("SELECT * FROM compensations ORDER BY id").fetchall()
     return {
         "sales": [dict(r) for r in sales],
         "subscriptions": [dict(r) for r in subs],
         "staff": [dict(r) for r in staff],
         "products": [dict(r) for r in products],
+        "trials": [dict(r) for r in trials],
+        "compensations": [dict(r) for r in compensations],
         "settings": {r["key"]: r["value"] for r in settings},
     }
 
@@ -1105,6 +1147,248 @@ def renew_subscription(sub_id: int, paid: bool = True, logged_by=None, today: da
         "new_id": new_id, "old": old, "start": today, "end": end_date,
         "duration": duration, "extra_days": extra, "profit": profit,
     }
+
+
+# ---------- duplicate detection ----------
+
+def find_duplicates(kind: str, customer, item: str, day_iso: str, sold_price: float, logged_by, limit: int = 3):
+    """
+    Entries that look like the one about to be saved.
+      * customer known: same customer + item + date (an exact repeat is almost always an accident)
+      * no customer (walk-in sale): same item, date and price logged by the same person in the last 10 minutes
+    kind: 'sale' | 'sub'. Newest first.
+    """
+    table, datecol = ("sales", "sale_date") if kind == "sale" else ("subscriptions", "start_date")
+    with get_conn() as conn:
+        if customer:
+            return conn.execute(
+                f"SELECT * FROM {table} WHERE LOWER(customer) = LOWER(%s) AND LOWER(item) = LOWER(%s) "
+                f"AND {datecol} = %s ORDER BY id DESC LIMIT %s",
+                (customer, item, day_iso, limit),
+            ).fetchall()
+        return conn.execute(
+            f"SELECT * FROM {table} WHERE customer IS NULL AND LOWER(item) = LOWER(%s) AND {datecol} = %s "
+            "AND ABS(sold_price - %s) < 0.005 AND logged_by IS NOT DISTINCT FROM %s "
+            "AND created_at > now() - make_interval(mins => 10) ORDER BY id DESC LIMIT %s",
+            (item, day_iso, sold_price, logged_by, limit),
+        ).fetchall()
+
+
+# ---------- free trials ----------
+
+def find_product(kind: str, name: str):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM products WHERE kind=%s AND LOWER(name)=LOWER(%s) LIMIT 1", (kind, name)
+        ).fetchone()
+
+
+def add_trial(customer, item, days, *, start=None, cost_price=0.0, seller=None, supplier=None, logged_by=None,
+              platform=None, phone=None, tg_id=None, tg_username=None, ig_username=None):
+    """Returns (trial_id, end_date)."""
+    start = start or date.today()
+    end = start + timedelta(days=int(days))
+    with get_conn() as conn:
+        row = conn.execute(
+            "INSERT INTO trials (customer, item, start_date, end_date, cost_price, seller, supplier, logged_by, "
+            "platform, phone, tg_id, tg_username, ig_username) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (customer, item, start.isoformat(), end.isoformat(), cost_price, seller, supplier, logged_by,
+             platform, phone, tg_id, tg_username, ig_username),
+        ).fetchone()
+        conn.commit()
+    return row["id"], end
+
+
+def get_trial(trial_id: int):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM trials WHERE id=%s", (trial_id,)).fetchone()
+
+
+def list_active_trials():
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM trials WHERE status='active' ORDER BY end_date, id").fetchall()
+
+
+def find_active_trial(customer: str, item: str):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM trials WHERE status='active' AND LOWER(customer)=LOWER(%s) AND LOWER(item)=LOWER(%s) "
+            "ORDER BY id DESC LIMIT 1", (customer, item),
+        ).fetchone()
+
+
+def trials_due_for_reminder(today: date):
+    """(ending_tomorrow, ended_or_ends_today) among active trials that haven't been reminded yet."""
+    with get_conn() as conn:
+        soon = conn.execute(
+            "SELECT * FROM trials WHERE status='active' AND reminded_soon=0 AND end_date = %s",
+            ((today + timedelta(days=1)).isoformat(),),
+        ).fetchall()
+        due = conn.execute(
+            "SELECT * FROM trials WHERE status='active' AND reminded_due=0 AND end_date <= %s",
+            (today.isoformat(),),
+        ).fetchall()
+    return soon, due
+
+
+def mark_trial_reminded(trial_id: int, due: bool):
+    col = "reminded_due" if due else "reminded_soon"
+    with get_conn() as conn:
+        conn.execute(f"UPDATE trials SET {col}=1 WHERE id=%s", (trial_id,))
+        conn.commit()
+
+
+def set_trial_status(trial_id: int, status: str, sub_id=None) -> bool:
+    """Decide an active trial. Only an undecided trial can change, so a double tap does nothing."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE trials SET status=%s, converted_sub_id=%s WHERE id=%s AND status='active'",
+            (status, sub_id, trial_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def convert_matching_trial(customer: str, item: str, sub_id: int):
+    """A paid subscription was logged: if that customer had an undecided trial of the same item, it converted."""
+    trial = find_active_trial(customer, item) if customer else None
+    if trial and set_trial_status(trial["id"], "converted", sub_id):
+        return trial["id"]
+    return None
+
+
+def close_stale_trials(today: date, days: int = 14) -> int:
+    """Trials nobody decided on for `days` days after they ended count as lost."""
+    cutoff = (today - timedelta(days=days)).isoformat()
+    with get_conn() as conn:
+        cur = conn.execute("UPDATE trials SET status='lost' WHERE status='active' AND end_date < %s", (cutoff,))
+        conn.commit()
+        return cur.rowcount
+
+
+def delete_trial(trial_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM trials WHERE id=%s", (trial_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def trial_stats(since_iso: str) -> dict:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) n, COALESCE(SUM(cost_price), 0) cost FROM trials WHERE start_date >= %s "
+            "GROUP BY status", (since_iso,),
+        ).fetchall()
+    stats = {"active": 0, "converted": 0, "lost": 0, "cost": 0.0}
+    for r in rows:
+        stats[r["status"]] = r["n"]
+        stats["cost"] += r["cost"]
+    stats["started"] = stats["active"] + stats["converted"] + stats["lost"]
+    return stats
+
+
+# ---------- outage compensation ----------
+
+def _running_subscriptions(conn, today: date, item=None):
+    """Subscriptions that are running right now and haven't been replaced by a renewal (lifetime ones excluded)."""
+    sql = ("SELECT * FROM subscriptions WHERE renewed_to IS NULL AND start_date <= %s AND end_date >= %s")
+    params = [today.isoformat(), today.isoformat()]
+    if item is not None:
+        sql += " AND LOWER(item) = LOWER(%s)"
+        params.append(item)
+    rows = conn.execute(sql + " ORDER BY end_date, id", params).fetchall()
+    return [r for r in rows
+            if (date.fromisoformat(r["end_date"]) - date.fromisoformat(r["start_date"])).days < LIFETIME_THRESHOLD_DAYS]
+
+
+def compensation_items(today: date = None):
+    """[(item, running_subscription_count)] biggest first -- the products an outage could have affected."""
+    today = today or date.today()
+    with get_conn() as conn:
+        rows = _running_subscriptions(conn, today)
+    counts = {}
+    for r in rows:
+        key = r["item"].strip().lower()
+        counts.setdefault(key, [r["item"], 0])[1] += 1
+    return sorted(((name, n) for name, n in counts.values()), key=lambda x: (-x[1], x[0].lower()))
+
+
+def compensation_targets(item: str, today: date = None):
+    today = today or date.today()
+    with get_conn() as conn:
+        return _running_subscriptions(conn, today, item)
+
+
+def _rearm_reminders(conn, sub_id: int, new_end_iso: str, today: date):
+    """After an end date moves: remind again for a future date; mark as ended (no surprise reminder) for a past one."""
+    if new_end_iso >= today.isoformat():
+        conn.execute("UPDATE subscriptions SET reminded_soon=0, reminded_due=0, active=1 WHERE id=%s", (sub_id,))
+    else:
+        conn.execute("UPDATE subscriptions SET reminded_soon=1, reminded_due=1, active=0 WHERE id=%s", (sub_id,))
+
+
+def apply_compensation(item: str, days: int, reason, logged_by, today: date = None):
+    """
+    Adds `days` to the end date of every running subscription of `item`, in one transaction, and records it so it
+    can be undone. Returns (compensation_id, [subscription rows with a 'new_end' key]) or None if nothing matched.
+    """
+    today = today or date.today()
+    with get_conn() as conn:
+        rows = _running_subscriptions(conn, today, item)
+        if not rows:
+            return None
+        affected, out = [], []
+        for r in rows:
+            new_end = (date.fromisoformat(r["end_date"]) + timedelta(days=days)).isoformat()
+            conn.execute("UPDATE subscriptions SET end_date=%s WHERE id=%s", (new_end, r["id"]))
+            _rearm_reminders(conn, r["id"], new_end, today)
+            affected.append({"id": r["id"], "old_end": r["end_date"], "new_end": new_end})
+            out.append({**dict(r), "new_end": new_end})
+        comp = conn.execute(
+            "INSERT INTO compensations (item, days, reason, logged_by, affected) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (item, days, reason, logged_by, json.dumps(affected)),
+        ).fetchone()
+        conn.commit()
+    return comp["id"], out
+
+
+def get_compensation(comp_id: int):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM compensations WHERE id=%s", (comp_id,)).fetchone()
+
+
+def list_compensations(limit: int = 10):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM compensations ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
+
+
+def undo_compensation(comp_id: int, today: date = None):
+    """
+    Takes the days back off the same subscriptions (from their *current* end date, so later edits survive).
+    Returns ("ok", count) | ("missing", 0) | ("already", 0).
+    """
+    today = today or date.today()
+    with get_conn() as conn:
+        comp = conn.execute("SELECT * FROM compensations WHERE id=%s", (comp_id,)).fetchone()
+        if not comp:
+            return "missing", 0
+        # claim it first: a second tap finds undone=1 and does nothing
+        cur = conn.execute("UPDATE compensations SET undone=1 WHERE id=%s AND undone=0", (comp_id,))
+        if cur.rowcount == 0:
+            return "already", 0
+        count = 0
+        for a in json.loads(comp["affected"]):
+            sub = conn.execute("SELECT end_date, renewed_to FROM subscriptions WHERE id=%s", (a["id"],)).fetchone()
+            if not sub:
+                continue  # deleted since
+            new_end = (date.fromisoformat(sub["end_date"]) - timedelta(days=comp["days"])).isoformat()
+            conn.execute("UPDATE subscriptions SET end_date=%s WHERE id=%s", (new_end, a["id"]))
+            if not sub["renewed_to"]:
+                _rearm_reminders(conn, a["id"], new_end, today)
+            count += 1
+        conn.commit()
+    return "ok", count
 
 
 # ---------- undo ----------
