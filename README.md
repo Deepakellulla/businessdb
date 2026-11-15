@@ -204,7 +204,7 @@ The bot messages **you** (the owner) when something goes wrong, so you find out 
 - an error while handling any command or button — with *what was being done* (e.g. `sent: /editsub 5`, by whom), the error and the file/line;
 - a failed save, a failed Google Sheets sync, a failed daily job (reminders, summary, username check);
 - the database becoming unreachable — and a 🟢 message when it's back;
-- a second copy of the bot running (Telegram "409 Conflict" — the cause of commands randomly doing nothing);
+- a second copy of the bot running (Telegram "409 Conflict" — the cause of commands randomly doing nothing). It's only reported if it lasts over a minute, because a few seconds of overlap while a new version deploys is normal. To find the stray copy fast: in @BotFather send `/revoke`, pick the bot, and put the new token in `BOT_TOKEN` — every other copy stops at once;
 - an unstable connection to Telegram (only after several errors in a few minutes — one-off timeouts are normal);
 - the bot crashing on start-up or while running.
 
